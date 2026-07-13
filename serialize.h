@@ -68,7 +68,11 @@
         #error serialize.modern requires C++23. Compile with /std:c++latest, or use classic serialize for older toolchains.
     #endif
 #elif defined(__cplusplus)
-    #if __cplusplus < 202302L
+    // 202100L rather than 202302L: GCC 13 and earlier report __cplusplus as 202100L in -std=c++23
+    // mode because their C++23 support is incomplete (GCC 14 is the first to report 202302L).
+    // Everything this header needs (<bit>, std::byteswap, std::bit_cast, std::endian, if constexpr)
+    // is present from GCC 12, so the partial-support value is accepted.
+    #if __cplusplus < 202100L
         #error serialize.modern requires C++23. Compile with -std=c++23, or use classic serialize for older toolchains.
     #endif
 #endif
