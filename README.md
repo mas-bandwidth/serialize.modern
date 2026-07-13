@@ -89,7 +89,7 @@ Measured on Apple Silicon (Apple clang, Release, medians of interleaved runs) ag
 | schema write | — | ~520 M packets/s |
 | schema read | — | ~430 M packets/s |
 
-The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations).
+The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations). Schema read and write are radically faster than classical because the read and write codepaths are completely optimized down at compile time.
 
 # Limitations
 
