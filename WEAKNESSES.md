@@ -25,14 +25,17 @@ this failure mode with hand-written serialize functions. Mitigation today: the e
 `MeasureBits` makes a missing field show up as a size discrepancy in any test that compares
 against a known wire size.
 
-## 3. Diagnostics degrade off the paved path
+## 3. Error cascades after the first diagnostic line
 
-The common schema mistakes produce one-line static_assert messages that name the fix. But the
-coverage is not total: a wrong object type hidden *inside a branch side* (rather than at the top
-level of the schema) is still rejected with a raw template trace — currently 17 lines of
-`no matching function for call to 'write'` — because the coherence check walks the flattened top
-level only. Correctness is unaffected; the experience of debugging a deeply nested schema mistake
-is not what the top-level errors promise.
+Schema misuse is reported by named static_assert messages that state the mistake and the fix —
+including deep cases: wrong object types inside branch sides and match cases, wrong inner types
+in `object`/`array`/`array_n`, bare fields where a `fields<...>` list is needed, non-fields in a
+schema, non-member-pointers in a field (an eight-case misuse matrix pins this, and composite
+fields validate their own children, so the property holds at any nesting depth by induction).
+What remains: after the named first line, compilers usually append the underlying instantiation
+trace anyway — the first line is always the answer, but it is not always alone. Fully
+suppressing the cascade would require conditional-instantiation surgery that is not worth its
+complexity. And misuse patterns outside the matrix may still produce raw traces; report them.
 
 ## 4. Fuzzing compile time specialized code has a ceiling
 

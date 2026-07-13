@@ -317,6 +317,25 @@ defect); rounds 10-19 were the mandated overtime. Compact record:
   tester. That is what diminishing returns looks like; the record exists
   so nobody has to rediscover it.
 
+Diagnostics pass (July 2026, owner-requested): reduce template error
+vomit. An eight-case misuse matrix (mixed types in branch sides / match
+cases / object / array / array_n inners, bare field as a branch side,
+non-field in a schema, non-member-pointer in a field) produced 17-116
+line unnamed traces. Now all eight open with a named static_assert
+stating the mistake and the fix. Design: composite fields validate their
+OWN children (is_fields_list / all_schema_fields / same_object_type /
+is_case traits, benign primaries so only the most specific assert
+fires), giving induction to any nesting depth; member_traits' primary
+template carries a named assert for non-member-pointers. Key subtlety:
+flatten pattern-matches object/array/bits_array without instantiating
+them, so their internal asserts never fire on their own —
+schema<> forces completion via sizeof (complete_fields) so each field's
+diagnostics run at the point that names the mistake. Compile time
+unchanged (the walks were already paid for by valid_references);
+verified on clang and GCC 16. Cascade lines after the named first line
+remain — full suppression needs conditional-instantiation surgery,
+rejected as not worth it. WEAKNESSES.md item 3 rewritten accordingly.
+
 Benchmark epistemology, learned the hard way:
 
 - The classic fixed-width bitpacker benchmark flatters whichever design the

@@ -1436,14 +1436,79 @@ namespace serialize
     /// continues at a runtime byte offset, or a relative integer with one path per bucket.
     enum class field_kind { leaf, bytes, branch, branch_on, match, counted, dynamic, relative };
 
+    template <typename... Fields> struct fields;
+    template <auto Member, typename Inner> struct object;
+    template <auto Member, typename Inner, int64_t Count> struct array;
+    template <auto Member, int Bits, int64_t Count> struct bits_array;
+    template <int64_t Value, typename... Fields_> struct case_;
+
     namespace schema_detail
     {
-        template <typename M> struct member_traits;
+        template <typename> inline constexpr bool dependent_false = false;
+
+        // the primary template is a named diagnostic: anything that is not a member pointer gets
+        // one clear line instead of an "undefined template" instantiation trace.
+        template <typename M> struct member_traits
+        {
+            static_assert( dependent_false<M>,
+                "schema fields name members with a member pointer, like bits<&Type::member, 7> or float_<&Type::member>" );
+        };
         template <typename C, typename V> struct member_traits<V C::*>
         {
             using object_type = C;
             using value_type = V;
         };
+
+        // diagnostic vocabulary: composite fields (branch, match, object, array, array_n) validate
+        // their own children with these, so a mistake nested deep inside a schema is reported as one
+        // named line at the construct that contains it, not as a template trace from the runner.
+        template <typename F> struct is_expanded_field : std::false_type {};
+        template <auto M, typename I> struct is_expanded_field<object<M, I>> : std::true_type {};
+        template <auto M, typename I, int64_t C> struct is_expanded_field<array<M, I, C>> : std::true_type {};
+        template <auto M, int B, int64_t C> struct is_expanded_field<bits_array<M, B, C>> : std::true_type {};
+
+        template <typename F> concept schema_field =
+            is_expanded_field<F>::value ||
+            requires { requires std::is_same_v<std::remove_cv_t<decltype( F::kind )>, field_kind>; };
+
+        template <typename List> struct is_fields_list : std::false_type {};
+        template <typename... Fs> struct is_fields_list<fields<Fs...>> : std::true_type {};
+
+        // benign primary: when the argument is not a fields list at all, is_fields_list reports it
+        // with its own message and these must not add a second error on top.
+        template <typename List> struct all_schema_fields { static constexpr bool value = true; };
+        template <typename... Fs> struct all_schema_fields<fields<Fs...>> { static constexpr bool value = ( schema_field<Fs> && ... ); };
+
+        template <typename F> concept names_object_type = requires { typename F::object_type; };
+
+        template <typename T, typename List> struct same_object_type { static constexpr bool value = true; };
+        template <typename T> struct same_object_type<T, fields<>>
+        {
+            static constexpr bool value = true;
+        };
+        template <typename T, typename F, typename... Fs> requires names_object_type<F>
+        struct same_object_type<T, fields<F, Fs...>>
+        {
+            static constexpr bool value = std::is_same_v<T, typename F::object_type>
+                                       && same_object_type<T, fields<Fs...>>::value;
+        };
+        template <typename T, typename F, typename... Fs> requires ( !names_object_type<F> )
+        struct same_object_type<T, fields<F, Fs...>>
+        {
+            static constexpr bool value = same_object_type<T, fields<Fs...>>::value;
+        };
+
+        template <typename C> struct is_case : std::false_type {};
+        template <int64_t V, typename... Fs> struct is_case<case_<V, Fs...>> : std::true_type {};
+
+        template <typename C> struct case_list { using type = fields<>; };                 // benign for non-cases
+        template <int64_t V, typename... Fs> struct case_list<case_<V, Fs...>> { using type = fields<Fs...>; };
+
+        // object, array and bits_array are expanded by flatten without ever being instantiated, so
+        // their own diagnostics would never fire. sizeof forces each top level field complete, which
+        // runs the asserts inside it at the point that names the mistake. always true; the value is
+        // the side effect.
+        template <typename... Fs> inline constexpr bool complete_fields = ( ( sizeof( Fs ) > 0 ) && ... );
 
         // a member access path from the schema's root object: member pointers, with array element
         // indexes interleaved. two paths are the same access iff their types are the same, which is
@@ -2013,6 +2078,13 @@ namespace serialize
 
         static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, bool>,
             "schema branch field: condition member must be bool (match for integer selectors)" );
+        static_assert( schema_detail::is_fields_list<ThenFields>::value && schema_detail::is_fields_list<ElseFields>::value,
+            "branch: the two sides must be serialize::fields< ... > lists (wrap a single field in fields<>)" );
+        static_assert( schema_detail::all_schema_fields<ThenFields>::value && schema_detail::all_schema_fields<ElseFields>::value,
+            "branch: a side contains something that is not a schema field" );
+        static_assert( schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::object_type, ThenFields>::value
+                    && schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::object_type, ElseFields>::value,
+            "branch: a field inside a side serializes a member of a different object type (nest inner objects with object<>)" );
 
         static constexpr field_kind kind = field_kind::branch;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -2040,6 +2112,13 @@ namespace serialize
 
         static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, bool>,
             "schema branch_on field: condition member must be bool (match for integer selectors)" );
+        static_assert( schema_detail::is_fields_list<ThenFields>::value && schema_detail::is_fields_list<ElseFields>::value,
+            "branch_on: the two sides must be serialize::fields< ... > lists (wrap a single field in fields<>)" );
+        static_assert( schema_detail::all_schema_fields<ThenFields>::value && schema_detail::all_schema_fields<ElseFields>::value,
+            "branch_on: a side contains something that is not a schema field" );
+        static_assert( schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::object_type, ThenFields>::value
+                    && schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::object_type, ElseFields>::value,
+            "branch_on: a field inside a side serializes a member of a different object type (nest inner objects with object<>)" );
 
         static constexpr field_kind kind = field_kind::branch_on;
         using writes = schema_detail::path_list<>;
@@ -2074,6 +2153,12 @@ namespace serialize
 
         static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type> || std::is_enum_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema match field: selector member must be an integral or enum type" );
+        static_assert( ( schema_detail::is_case<Cases>::value && ... ),
+            "match: everything after the selector member must be a case_<Value, ...fields...>" );
+        static_assert( ( schema_detail::all_schema_fields<typename schema_detail::case_list<Cases>::type>::value && ... ),
+            "match: a case contains something that is not a schema field" );
+        static_assert( ( schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::object_type, typename schema_detail::case_list<Cases>::type>::value && ... ),
+            "match: a field inside a case serializes a member of a different object type (nest inner objects with object<>)" );
 
         static constexpr field_kind kind = field_kind::match;
         using writes = schema_detail::path_list<>;
@@ -2507,6 +2592,12 @@ namespace serialize
     {
         static_assert( std::is_class_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema object field: member must be a class type" );
+        static_assert( schema_detail::is_fields_list<typename schema_detail::field_list_of<Inner>::type>::value,
+            "object<>: Inner must be a schema<...> or a fields<...> list over the member's type" );
+        static_assert( schema_detail::all_schema_fields<typename schema_detail::field_list_of<Inner>::type>::value,
+            "object<>: the inner list contains something that is not a schema field" );
+        static_assert( schema_detail::same_object_type<typename schema_detail::member_traits<decltype(Member)>::value_type, typename schema_detail::field_list_of<Inner>::type>::value,
+            "object<>: the inner schema serializes a different type than the member" );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
     };
 
@@ -2520,6 +2611,12 @@ namespace serialize
               int64_t Count = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> )>
     struct array
     {
+        static_assert( schema_detail::is_fields_list<typename schema_detail::field_list_of<Inner>::type>::value,
+            "array<>: Inner must be a schema<...> or a fields<...> list over the element type" );
+        static_assert( schema_detail::all_schema_fields<typename schema_detail::field_list_of<Inner>::type>::value,
+            "array<>: the inner list contains something that is not a schema field" );
+        static_assert( schema_detail::same_object_type<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>, typename schema_detail::field_list_of<Inner>::type>::value,
+            "array<>: the inner schema serializes a different type than the array element" );
         static_assert( Count >= 1 );
         static_assert( Count <= int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> ) );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
@@ -2561,6 +2658,12 @@ namespace serialize
               int64_t MaxCount = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type> )>
     struct array_n
     {
+        static_assert( schema_detail::is_fields_list<typename schema_detail::field_list_of<Inner>::type>::value,
+            "array_n<>: Inner must be a schema<...> or a fields<...> list over the element type" );
+        static_assert( schema_detail::all_schema_fields<typename schema_detail::field_list_of<Inner>::type>::value,
+            "array_n<>: the inner list contains something that is not a schema field" );
+        static_assert( schema_detail::same_object_type<std::remove_extent_t<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type>, typename schema_detail::field_list_of<Inner>::type>::value,
+            "array_n<>: the inner schema serializes a different type than the array element" );
         using object_type = typename schema_detail::member_traits<decltype(ItemsMember)>::object_type;
         using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
 
@@ -3449,8 +3552,6 @@ namespace serialize
 
         // the schema's object type comes from the first field that names one: fields with no
         // member (const_, reserved_, align) are transparent to the deduction
-        template <typename F> concept names_object_type = requires { typename F::object_type; };
-
         template <typename List> struct first_object_type;
         template <typename F, typename... Fs> requires names_object_type<F>
         struct first_object_type<fields<F, Fs...>>
@@ -3463,24 +3564,6 @@ namespace serialize
             using type = typename first_object_type<fields<Fs...>>::type;
         };
 
-        // every field that names an object type must agree with the schema's: mixing members of
-        // different structs in one field list is a named compile error, not a template trace.
-        template <typename T, typename List> struct same_object_type;
-        template <typename T> struct same_object_type<T, fields<>>
-        {
-            static constexpr bool value = true;
-        };
-        template <typename T, typename F, typename... Fs> requires names_object_type<F>
-        struct same_object_type<T, fields<F, Fs...>>
-        {
-            static constexpr bool value = std::is_same_v<T, typename F::object_type>
-                                       && same_object_type<T, fields<Fs...>>::value;
-        };
-        template <typename T, typename F, typename... Fs> requires ( !names_object_type<F> )
-        struct same_object_type<T, fields<F, Fs...>>
-        {
-            static constexpr bool value = same_object_type<T, fields<Fs...>>::value;
-        };
     }
 
     /**
@@ -3512,6 +3595,11 @@ namespace serialize
 
     template <typename FirstField, typename... RestFields> struct schema
     {
+        static_assert( schema_detail::all_schema_fields<fields<FirstField, RestFields...>>::value,
+                       "schema arguments must be schema fields: bits, int_, bool_, float_, object, branch, match, array, string, ... (see SCHEMA.md)" );
+
+        static_assert( schema_detail::complete_fields<FirstField, RestFields...> );     // instantiates each field: their own diagnostics fire here
+
         static_assert( valid_references<FirstField, RestFields...>,
                        "branch_on/match must reference a member serialized unconditionally EARLIER in the schema: back references only, never forward references" );
 
