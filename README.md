@@ -15,6 +15,8 @@
 > vocabulary, the branch/match/back-reference model, the array and string strategies, and anything
 > you find missing or awkward. Please open an issue at
 > [github.com/mas-bandwidth/serialize.modern/issues](https://github.com/mas-bandwidth/serialize.modern/issues).
+> An honest, maintained list of the library's current weaknesses lives in
+> [WEAKNESSES.md](WEAKNESSES.md).
 
 It requires C++23 and produces **byte-identical wire output to classic serialize**: data written by either library reads back correctly with the other. This is enforced in CI on every pull request — a harness is built against both libraries, the two streams must match byte-for-byte, and each library must decode the stream the other wrote.
 
