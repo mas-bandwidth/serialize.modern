@@ -65,7 +65,7 @@ A `serialize::schema< Field, Fields... >` provides:
 |---|---|
 | `Write( data, bytes, object )` | serialize the object; returns bytes written. No flush step. |
 | `Read( data, bytes, object )` | deserialize and validate; returns false for malformed packets. |
-| `MeasureBits( object )` / `MeasureBytes( object )` | the **exact** serialized size for this object (follows its branches, matches, counts and lengths). Unlike `MeasureStream`, alignment is computed from real offsets, so this is exact, not conservative. |
+| `MeasureBits( object )` / `MeasureBytes( object )` | the **exact** serialized size for this object (follows its branches, matches, counts and lengths). Unlike `MeasureStream`, alignment is computed from real offsets, so this is exact, not conservative. Also how to learn the size a successful `Read` consumed — e.g. to frame several packets in one buffer, measure the decoded object. |
 | `MaxBits` / `MaxBytes` | compile time constants: the longest path through the schema. Size write buffers from `MaxBytes`. |
 | `object_type` | the struct being serialized, deduced from the fields. |
 
@@ -80,6 +80,11 @@ input is the trust boundary. Writes are unchecked in release and assert in debug
 cannot be used (widen them, or keep those packets on the streams).
 
 ## Field reference
+
+Member types are checked at compile time: a float member in a `bits` field, a non-bool `branch`
+condition, a `string` over the wrong character type — each is a compile error whose message names
+the field to use instead, never a silent numeric conversion on the wire.
+
 
 ### Integers and scalars
 
@@ -184,6 +189,10 @@ Keep forking constructs near the end of the schema, keep `array_n` ranges small,
 `branch_on`/`match` over chains of `branch` where a single earlier field drives several decisions.
 Fixed-layout fields and runtime-length sections (`string`, `bytes_n`, `wstring_`) do not multiply
 paths.
+
+The same multipliers govern compile time: a translation unit with an ordinary fixed-layout schema
+compiles as fast as the equivalent stream serialize method (measured at parity), while a TU that
+instantiates many schemas full of forking constructs pays proportionally.
 
 ## What stays on the streams
 

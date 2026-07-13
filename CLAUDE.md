@@ -170,6 +170,38 @@ Rejected, with measurements — do not re-propose without new evidence:
 - PGO (Apple clang, instrumented profile of the benchmark itself): −15%
   stream write. Measure before trusting PGO on this kind of code.
 
+Second red/blue round (July 2026, after the schema language landed):
+
+- **Accepted: member type constraints on schema fields.** Before: a float
+  member in a `bits` field *compiled* and silently truncated (3.7 wrote as
+  3) — member pointers had erased the type check the stream macros do
+  naturally. Every field now static_asserts its member type with a message
+  naming the correct field; the predicates (`unsigned_bits_member`,
+  `integer_member`) are pinned both-polarities in the tests. Zero runtime
+  cost: codegen audit and wire gate unchanged. Note `int_relative_` accepts
+  any non-bool integral (classic's macro does), and `bits_array`/`object`
+  have no `kind` member — they are expanded by flatten, so their asserts
+  live directly in the struct body.
+- **Measured: compile time.** A typical 7-field packet TU: schema 0.07s vs
+  stream method 0.08s — parity for consumers. The full 28-test suite TU is
+  ~3.9s: the code-size multipliers (branch x2, match x(cases+1), array_n
+  x range, relative x7) govern compile time too. Documented in SCHEMA.md.
+- **Rejected without new experiments** (by record or by the gates'
+  definition): C++26 reflection to auto-derive schemas (not shipped in any
+  targeted toolchain; the natural future front end — revisit when GCC,
+  clang and MSVC all ship P2996); constexpr/consteval Read/Write
+  (compile-time round trips duplicate the get/put paths under `if
+  consteval` for zero runtime asm change; golden bytes already CI-pinned);
+  `[[likely]]` on schema validation (streams measured -10%); shared aligned
+  window loads (the grouped-decode +3%-in-noise result); binary dispatch
+  trees for match/array_n selection (ranges are capped small, forward
+  compares predict well); coroutine/incremental decode and std::expected
+  returns (runtime frames, indirect calls, error taxonomies — the things
+  the codegen gate exists to forbid); DSL/UDL sugar and modules (no asm
+  change). The one real gap inside the std::expected proposal — "how many
+  bytes did Read consume?" — was already answered exactly by MeasureBits on
+  the decoded object, now documented in SCHEMA.md.
+
 Benchmark epistemology, learned the hard way:
 
 - The classic fixed-width bitpacker benchmark flatters whichever design the

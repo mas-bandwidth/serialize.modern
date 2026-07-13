@@ -1573,6 +1573,15 @@ namespace serialize
                 flush_words<SegBase, K, I + 1>( data, words );
             }
         }
+
+        // member type constraints for schema fields: a wrong member type must be a clear compile
+        // error naming the fix, never a silent numeric conversion on the wire (a float member in a
+        // bits field would otherwise compile and truncate).
+        template <typename T> inline constexpr bool unsigned_bits_member =
+            ( std::is_unsigned_v<T> && !std::is_same_v<T, bool> ) || std::is_enum_v<T>;
+
+        template <typename T> inline constexpr bool integer_member =
+            std::is_integral_v<T> && !std::is_same_v<T, bool>;
     }
 
     /// Serialize an unsigned integral member with a fixed number of bits in [1,64]. Wire identical to serialize_bits.
@@ -1581,6 +1590,9 @@ namespace serialize
         static_assert( Bits >= 1 && Bits <= 64 );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
         using value_type = typename schema_detail::member_traits<decltype(Member)>::value_type;
+
+        static_assert( schema_detail::unsigned_bits_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema bits field: member must be an unsigned integral or enum type (int_ for signed integers, bool_ for bool, float_ for float)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1605,6 +1617,9 @@ namespace serialize
     {
         static_assert( Min < Max );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema int_ field: member must be an integral type (enum_ for enums, bool_ for bool)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1639,6 +1654,9 @@ namespace serialize
         static_assert( Min < Max );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
+        static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema int64 field: member must be an integral type (enum_ for enums, bool_ for bool)" );
+
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
         static constexpr int Bits = bits_required_v<Min, Max>;
@@ -1671,6 +1689,9 @@ namespace serialize
     {
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, bool>,
+            "schema bool_ field: member must be bool" );
+
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
@@ -1693,6 +1714,9 @@ namespace serialize
     {
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, float>,
+            "schema float_ field: member must be float (double_ for double)" );
+
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
@@ -1714,6 +1738,9 @@ namespace serialize
     template <auto Member> struct double_
     {
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, double>,
+            "schema double_ field: member must be double (float_ for float)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1797,6 +1824,9 @@ namespace serialize
         static constexpr uint32_t max_value = uint32_t( MaxValue );
         static_assert( max_value >= 1 );
 
+        static_assert( std::is_enum_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema enum_ field: member must be an enum type (int_ or bits for integers)" );
+
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
@@ -1832,6 +1862,9 @@ namespace serialize
         static_assert( Res > 0.0f );
 
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, float>,
+            "schema compressed_float_ field: member must be float" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1921,6 +1954,11 @@ namespace serialize
         static_assert( NumBytes >= 1 );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
+        static_assert( std::is_bounded_array_v<typename schema_detail::member_traits<decltype(Member)>::value_type> && std::is_same_v<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>, uint8_t>,
+            "schema bytes field: member must be a uint8_t array" );
+        static_assert( int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> ) >= NumBytes,
+            "schema bytes field: member array is smaller than NumBytes" );
+
         static constexpr field_kind kind = field_kind::bytes;
         static constexpr int64_t num_bytes = NumBytes;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1946,6 +1984,9 @@ namespace serialize
         using then_list = ThenFields;
         using else_list = ElseFields;
 
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, bool>,
+            "schema branch field: condition member must be bool (match for integer selectors)" );
+
         static constexpr field_kind kind = field_kind::branch;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
@@ -1969,6 +2010,9 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
         using then_list = ThenFields;
         using else_list = ElseFields;
+
+        static_assert( std::is_same_v<typename schema_detail::member_traits<decltype(Member)>::value_type, bool>,
+            "schema branch_on field: condition member must be bool (match for integer selectors)" );
 
         static constexpr field_kind kind = field_kind::branch_on;
         using writes = schema_detail::path_list<>;
@@ -2001,6 +2045,9 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
         using cases = case_pack<Cases...>;
 
+        static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type> || std::is_enum_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema match field: selector member must be an integral or enum type" );
+
         static constexpr field_kind kind = field_kind::match;
         using writes = schema_detail::path_list<>;
         using referenced = schema_detail::member_path<Member>;
@@ -2024,6 +2071,9 @@ namespace serialize
     {
         using object_type = typename schema_detail::member_traits<decltype(CurrMember)>::object_type;
         using value_type = typename schema_detail::member_traits<decltype(CurrMember)>::value_type;
+
+        static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(PrevMember)>::value_type> && schema_detail::integer_member<typename schema_detail::member_traits<decltype(CurrMember)>::value_type>,
+            "schema int_relative_ field: members must be integral types" );
 
         static constexpr field_kind kind = field_kind::relative;
         using writes = schema_detail::path_list<schema_detail::member_path<CurrMember>>;
@@ -2428,6 +2478,8 @@ namespace serialize
      */
     template <auto Member, typename Inner> struct object
     {
+        static_assert( std::is_class_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema object field: member must be a class type" );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
     };
 
@@ -2458,6 +2510,8 @@ namespace serialize
         static_assert( Count >= 1 );
         static_assert( Count <= int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> ) );
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+        static_assert( schema_detail::unsigned_bits_member<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>>,
+            "schema bits_array field: member must be an array of unsigned integrals or enums" );
     };
 
     /**
@@ -2489,6 +2543,9 @@ namespace serialize
         static_assert( max_count <= extent );
         static_assert( max_count - min_count <= 16, "array_n generates one specialized path per possible count: keep the count RANGE small (use the streams for large collections)" );
 
+        static_assert( schema_detail::integer_member<count_type>,
+            "schema array_n field: count member must be an integral type" );
+
         static constexpr field_kind kind = field_kind::counted;
         using writes = schema_detail::path_list<schema_detail::member_path<CountMember>>;
         static constexpr int count_bits = bits_required( 0, uint32_t( max_count - min_count ) );
@@ -2516,6 +2573,9 @@ namespace serialize
 
         static constexpr int64_t buffer_size = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> );
         static_assert( buffer_size >= 2 );
+
+        static_assert( std::is_bounded_array_v<typename schema_detail::member_traits<decltype(Member)>::value_type> && std::is_same_v<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>, char>,
+            "schema string field: member must be a char array" );
 
         static constexpr field_kind kind = field_kind::dynamic;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -2556,6 +2616,9 @@ namespace serialize
 
         static constexpr int64_t buffer_size = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> );
         static_assert( buffer_size >= 2 );
+
+        static_assert( std::is_bounded_array_v<typename schema_detail::member_traits<decltype(Member)>::value_type> && std::is_same_v<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>, wchar_t>,
+            "schema wstring_ field: member must be a wchar_t array" );
 
         static constexpr field_kind kind = field_kind::dynamic;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -2605,6 +2668,11 @@ namespace serialize
     {
         using object_type = typename schema_detail::member_traits<decltype(DataMember)>::object_type;
         using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
+
+        static_assert( std::is_bounded_array_v<typename schema_detail::member_traits<decltype(DataMember)>::value_type> && std::is_same_v<std::remove_extent_t<typename schema_detail::member_traits<decltype(DataMember)>::value_type>, uint8_t>,
+            "schema bytes_n field: data member must be a uint8_t array" );
+        static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(CountMember)>::value_type>,
+            "schema bytes_n field: count member must be an integral type" );
 
         static constexpr field_kind kind = field_kind::dynamic;
         using writes = schema_detail::path_list<schema_detail::member_path<DataMember>, schema_detail::member_path<CountMember>>;
@@ -5246,6 +5314,21 @@ using SchemaTestSchema = serialize::schema<
 // the longest path: 8 + 9 + 1 + 32 + 34 + 13 = 97 bits, align to 104, + 88 blob + 32 tail = 224
 static_assert( SchemaTestSchema::MaxBits == 224 );
 static_assert( SchemaTestSchema::MaxBytes == 28 );
+
+// the schema field member type constraints, both polarities: the fields enforce these on
+// instantiation (a float member in a bits field is a compile error, not a silent truncation);
+// this pins the predicates themselves on every compiler.
+static_assert( serialize::schema_detail::unsigned_bits_member<uint32_t> );
+static_assert( serialize::schema_detail::unsigned_bits_member<uint64_t> );
+static_assert( serialize::schema_detail::unsigned_bits_member<std::byte> );     // enums qualify
+static_assert( !serialize::schema_detail::unsigned_bits_member<int32_t> );      // int_ territory
+static_assert( !serialize::schema_detail::unsigned_bits_member<bool> );         // bool_ territory
+static_assert( !serialize::schema_detail::unsigned_bits_member<float> );        // float_ territory
+static_assert( serialize::schema_detail::integer_member<int32_t> );
+static_assert( serialize::schema_detail::integer_member<uint64_t> );
+static_assert( !serialize::schema_detail::integer_member<bool> );
+static_assert( !serialize::schema_detail::integer_member<double> );
+static_assert( !serialize::schema_detail::integer_member<std::byte> );          // enum_ territory
 
 inline void test_schema()
 {
