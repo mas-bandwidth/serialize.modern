@@ -20,7 +20,7 @@
 
 It requires C++23 and produces **byte-identical wire output to classic serialize**: data written by either library reads back correctly with the other. This is enforced in CI on every pull request — a harness is built against both libraries, the two streams must match byte-for-byte, and each library must decode the stream the other wrote.
 
-It has the following features:
+It shares the following features with classic serialize:
 
 * Serialize a bool with only one bit
 * Serialize any integer value from [1,64] bits writing only that number of bits to the buffer
@@ -28,112 +28,18 @@ It has the following features:
 * Serialize floats, doubles, compressed floats, strings, byte arrays, and integers relative to another integer
 * Alignment support so you can align your bitstream to a byte boundary whenever you want
 * Optional template-based serialization so you can write one function that handles both read and write
+
+And has one new feature:
+
 * A compile time [schema language](SCHEMA.md) that generates zero-overhead serialization code: ~3x faster reads and up to ~7x faster writes than the stream path, byte-identical on the wire
 
 # Requirements
 
 A C++23 compiler: recent clang, GCC 12+, or MSVC 2022 (`-std=c++23` / `/std:c++latest`). If you need to support older toolchains, use [classic serialize](https://github.com/mas-bandwidth/serialize) — the wire formats are identical, so the two can interoperate across a network.
 
-# Usage
-
-The API is the same as classic serialize. You can use the bitpacker directly:
-
-```c++
-const int BufferSize = 256;
-
-uint8_t buffer[BufferSize + 8];         // + 8: buffer allocations extend 8 bytes past the end (see below)
-
-serialize::BitWriter writer( buffer, BufferSize );
-
-writer.WriteBits( 0, 1 );
-writer.WriteBits( 1, 1 );
-writer.WriteBits( 10, 8 );
-writer.WriteBits( 255, 8 );
-writer.WriteBits( 1000, 10 );
-writer.WriteBits( 50000, 16 );
-writer.WriteBits( 9999999, 32 );
-writer.FlushBits();
-
-const int bytesWritten = writer.GetBytesWritten();
-
-serialize::BitReader reader( buffer, bytesWritten );
-
-uint32_t a = reader.ReadBits( 1 );
-uint32_t b = reader.ReadBits( 1 );
-uint32_t c = reader.ReadBits( 8 );
-uint32_t d = reader.ReadBits( 8 );
-uint32_t e = reader.ReadBits( 10 );
-uint32_t f = reader.ReadBits( 16 );
-uint32_t g = reader.ReadBits( 32 );
-```
-
-Or you can write serialize methods for your types:
-
-```c++
-struct Vector
-{
-    float x,y,z;
-
-    template <typename Stream> bool Serialize( Stream & stream )
-    {
-        serialize_float( stream, x );
-        serialize_float( stream, y );
-        serialize_float( stream, z );
-        return true;
-    }
-};
-
-struct Quaternion
-{
-    float x,y,z,w;
-
-    template <typename Stream> bool Serialize( Stream & stream )
-    {
-        serialize_float( stream, x );
-        serialize_float( stream, y );
-        serialize_float( stream, z );
-        serialize_float( stream, w );
-        return true;
-    }
-};
-
-struct RigidBody
-{
-    Vector position;
-    Quaternion orientation;
-    Vector linearVelocity;
-    Vector angularVelocity;
-    bool atRest;
-
-    template <typename Stream> bool Serialize( Stream & stream )
-    {
-        serialize_object( stream, position );
-        serialize_object( stream, orientation );
-        serialize_bool( stream, atRest );
-        if ( !atRest )
-        {
-            serialize_object( stream, linearVelocity );
-            serialize_object( stream, angularVelocity );
-        }
-        else if ( Stream::IsReading )
-        {
-            linearVelocity.x = linearVelocity.y = linearVelocity.z = 0.0;
-            angularVelocity.x = angularVelocity.y = angularVelocity.z = 0.0;
-        }
-        return true;
-    }
-};
-```
-
-See [example.cpp](example.cpp) for more.
-
 # Compile time schemas
 
-Describe a packet as a schema type and every field offset, shift and mask becomes a compile time
-constant: reads compile to independent constant-offset loads, writes to ORs into a handful of
-registers. Measured on Apple Silicon: **~3x faster reads and up to ~7x faster writes** than the
-stream path, with byte-identical wire output to the equivalent serialize methods — schema and
-stream code interoperate freely.
+The distinguishing feature of this library is the new compile time schema support. With it you can describe structs and generate code that does all the work entirely at compile time, generating fully optimal read and write machine code for each path:
 
 ```c++
 struct Vec { float x, y, z; };
@@ -152,37 +58,21 @@ using BodySchema = serialize::schema<
         serialize::fields< serialize::object<&Body::velocity, VecSchema> > > >;
 
 int64_t bytesWritten = BodySchema::Write( buffer, BufferSize, body );
-bool ok = BodySchema::Read( buffer, bytesWritten, body );       // validates and rejects bad packets, like ReadStream
+
+bool ok = BodySchema::Read( buffer, bytesWritten, body );
 ```
 
 The language covers compile time if/else and switch (including back references to previously
 serialized fields, statically validated so forward references are compile errors), fixed and
 runtime-count arrays, strings and runtime-length byte blocks, relative integers, protocol
 constants and reserved bits, enums and compressed floats, and composition equivalent to
-serialize_object. `Schema::MeasureBits( object )` returns the exact serialized size for an object.
-Reads validate everything and reject malformed packets, exactly like the read stream.
+serialize_object.
 
-**The full reference is [SCHEMA.md](SCHEMA.md)** — field vocabulary, wire formats, the code size
-model, and what should stay on the streams. For how upcoming C++ features (C++26 reflection,
-contracts, expansion statements) are expected to shape the library, see [FUTURE.md](FUTURE.md).
+Full reference in [SCHEMA.md](SCHEMA.md).
 
 The zero-overhead property is enforced in CI on GCC, clang and MSVC: a codegen audit disassembles
 the generated schema functions on every pull request and fails on call instructions, loops,
 indirect branches or instruction-count blowups.
-
-# Differences from classic serialize
-
-The wire format is identical. What changed:
-
-* **One buffer rule instead of two.** For both writing and reading, the buffer allocation must extend at least 8 bytes past the end of the data. In exchange, write buffer *sizes* no longer need to be a multiple of 8 — any size works. (Classic requires multiple-of-8 write sizes and the +8 allocation only for reads.)
-* **Up to 56 bits move in a single operation.** New `WriteBits64`/`ReadBits64` on the bitpacker and `SerializeBits64` on the streams handle [1,64] bits per call, with widths up to 56 taking a single store or window load. `serialize_int64` with a range that fits 56 bits costs one operation instead of two. The bit stream is LSB-first, so the bytes are identical to the classic 32+32 split.
-* **C++23 internals.** `std::bit_width`, `std::bit_cast`, `std::byteswap` and `std::endian` replace the platform macros, compiler builtins and memcpy punning; the serialize macros use `if constexpr`; the bit math is constexpr and usable in `static_assert`.
-* **The hot core is explicitly force-inlined**, which measures significantly faster on the stream read and write paths.
-* `FlushBits` is still required after writing, exactly as in classic serialize.
-* The serialize macros' internal temporaries use reserved-style names (`serialize_temp_*`), so a
-  variable named e.g. `uint64_value` can no longer be silently shadowed into serializing zero.
-  (This applies to the `read_*`/`write_*` macro families too, which are otherwise identical to
-  classic.)
 
 # Performance
 
@@ -199,16 +89,11 @@ Measured on Apple Silicon (Apple clang, Release, medians of interleaved runs) ag
 | schema write | — | ~520 M packets/s |
 | schema read | — | ~430 M packets/s |
 
-The schema rows are the same benchmark packet serialized through the compile time schema path
-(bench.cpp verifies the bytes are identical to the stream path before timing): roughly 8x the
-stream writes and 3.5x the stream reads, with no classic equivalent to compare against.
-
 The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations).
 
 # Limitations
 
-* Buffer allocations must extend at least 8 bytes past the end of the data, for both writing and reading: the writer flushes whole qwords and the reader loads 64 bit windows at byte granularity. Bytes past the end of written data are only ever written as zeros; bytes past the end of read data are loaded but never interpreted. Buffers do not need any particular alignment: all memory access goes through memcpy.
-* Buffer sizes are effectively unlimited, because bit counts are stored in 64 bit signed integers.
+* Buffer allocations must extend at least 8 bytes past the end of the data for both reading and writing.
 * Wide strings are serialized as 32 bits per character, so streams are compatible between platforms with 2 and 4 byte wchar_t, but code points above 0xFFFF are not translated between UTF-16 and UTF-32 platforms.
 
 # Building
