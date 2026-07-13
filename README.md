@@ -4,19 +4,11 @@
 
 **serialize.modern** is the modern C++ port of [serialize](https://github.com/mas-bandwidth/serialize), a simple bitpacking serializer for C++.
 
-> **Status: pre-release.** serialize.modern is new and experimental. The wire format is pinned and
-> gated against classic serialize in CI, but the library itself — especially the compile time
-> schema language — is young, still evolving, and has not shipped in production anywhere. It is
-> **not** mature and production ready the way the other ports are: if you need battle tested today,
-> use [classic serialize](https://github.com/mas-bandwidth/serialize), which is wire compatible
-> with this library.
->
-> **Feedback is very much appreciated — especially on the schema language design**: the field
-> vocabulary, the branch/match/back-reference model, the array and string strategies, and anything
-> you find missing or awkward. Please open an issue at
-> [github.com/mas-bandwidth/serialize.modern/issues](https://github.com/mas-bandwidth/serialize.modern/issues).
-> An honest, maintained list of the library's current weaknesses lives in
-> [WEAKNESSES.md](WEAKNESSES.md).
+> **Status: pre-release and experimental.** The wire format is pinned, but the library — especially
+> the schema language — is young, still evolving, and has not shipped in production anywhere. If
+> you need battle tested today, use [classic serialize](https://github.com/mas-bandwidth/serialize);
+> the two are wire compatible, so you can switch later without a protocol change. Feedback is very
+> much appreciated — see [below](#feedback).
 
 It requires C++23 and produces **byte-identical wire output to classic serialize**: data written by either library reads back correctly with the other. This is enforced in CI on every pull request — a harness is built against both libraries, the two streams must match byte-for-byte, and each library must decode the stream the other wrote.
 
@@ -32,6 +24,8 @@ It shares the following features with classic serialize:
 And has one new feature:
 
 * A compile time [schema language](SCHEMA.md) that generates zero-overhead serialization code: ~3x faster reads and up to ~7x faster writes than the stream path, byte-identical on the wire
+
+The classic API — bitpacker, streams, the `serialize_*` macros — is carried over unchanged; see the [classic documentation](https://github.com/mas-bandwidth/serialize) and [example.cpp](example.cpp) for usage.
 
 # Requirements
 
@@ -68,6 +62,11 @@ runtime-count arrays, strings and runtime-length byte blocks, relative integers,
 constants and reserved bits, enums and compressed floats, and composition equivalent to
 serialize_object.
 
+Because a schema sees the packet as a type, mistakes stream code cannot catch are compile errors
+here: a float member in a `bits` field, a range the member type cannot hold, the same member
+serialized twice, a forward reference. Each is a named, one-line `static_assert` stating the
+mistake and the fix — not a template trace.
+
 Full reference in [SCHEMA.md](SCHEMA.md).
 
 The zero-overhead property is enforced in CI on GCC, clang and MSVC: a codegen audit disassembles
@@ -89,7 +88,7 @@ Measured on Apple Silicon (Apple clang, Release, medians of interleaved runs) ag
 | schema write | — | ~520 M packets/s |
 | schema read | — | ~430 M packets/s |
 
-The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations). Schema read and write are radically faster than classical because the read and write codepaths are completely optimized down at compile time.
+The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations). Schema read and write are radically faster than classical because the read and write codepaths are completely optimized down at compile time: on the benchmark packet that comes to **~12x classic's stream writes and ~3x its stream reads**, reproduced by the shipped [bench.cpp](bench.cpp), which verifies the schema bytes are identical to the stream path before timing.
 
 # Limitations
 
@@ -100,6 +99,15 @@ The raw bitpacker is at parity — the classic 64 bit scratch, qword flush write
 
 See [BUILDING.md](BUILDING.md) for CMake instructions, consuming the library in your project,
 running the wire compatibility gate against classic serialize, benchmarking and fuzzing.
+
+# Feedback
+
+The schema language is the part of this library that needs your eyes: the field vocabulary, the
+branch/match/back-reference model, the array and string strategies — anything missing or awkward.
+Please open an issue at
+[github.com/mas-bandwidth/serialize.modern/issues](https://github.com/mas-bandwidth/serialize.modern/issues).
+An honest, maintained list of the library's current weaknesses lives in
+[WEAKNESSES.md](WEAKNESSES.md).
 
 # Author
 
