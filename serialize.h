@@ -1442,6 +1442,37 @@ namespace serialize
             using value_type = V;
         };
 
+        // a member access path from the schema's root object: member pointers, with array element
+        // indexes interleaved. two paths are the same access iff their types are the same, which is
+        // how back references are validated at compile time.
+        template <auto... Steps> struct member_path {};
+
+        template <typename... Paths> struct path_list {};
+
+        template <typename P, auto... Outer> struct path_prepend;
+        template <auto... Steps, auto... Outer> struct path_prepend<member_path<Steps...>, Outer...>
+        {
+            using type = member_path<Outer..., Steps...>;
+        };
+
+        template <typename L, auto... Outer> struct paths_prepend;
+        template <typename... Ps, auto... Outer> struct paths_prepend<path_list<Ps...>, Outer...>
+        {
+            using type = path_list<typename path_prepend<Ps, Outer...>::type...>;
+        };
+
+        template <typename A, typename B> struct paths_concat;
+        template <typename... As, typename... Bs> struct paths_concat<path_list<As...>, path_list<Bs...>>
+        {
+            using type = path_list<As..., Bs...>;
+        };
+
+        template <typename P, typename L> struct path_in;
+        template <typename P, typename... Ps> struct path_in<P, path_list<Ps...>>
+        {
+            static constexpr bool value = ( std::is_same_v<P, Ps> || ... );
+        };
+
         template <int Bits>
         consteval uint64_t bit_mask()
         {
@@ -1549,6 +1580,7 @@ namespace serialize
         using value_type = typename schema_detail::member_traits<decltype(Member)>::value_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t ) { return Bits; }
 
@@ -1572,6 +1604,7 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
         static constexpr int Bits = bits_required_v<Min, Max>;
 
         static consteval int64_t bits_at( int64_t ) { return Bits; }
@@ -1604,6 +1637,7 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
         static constexpr int Bits = bits_required_v<Min, Max>;
 
         static consteval int64_t bits_at( int64_t ) { return Bits; }
@@ -1635,6 +1669,7 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t ) { return 1; }
 
@@ -1656,6 +1691,7 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t ) { return 32; }
 
@@ -1677,6 +1713,7 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
 
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t ) { return 64; }
 
@@ -1696,6 +1733,7 @@ namespace serialize
     struct align
     {
         static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<>;
 
         static consteval int64_t bits_at( int64_t K ) { return schema_detail::align_pad( K ); }
 
@@ -1725,6 +1763,7 @@ namespace serialize
 
         static constexpr field_kind kind = field_kind::bytes;
         static constexpr int64_t num_bytes = NumBytes;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t K ) { return schema_detail::align_pad( K ) + NumBytes * 8; }
 
@@ -1748,6 +1787,7 @@ namespace serialize
         using else_list = ElseFields;
 
         static constexpr field_kind kind = field_kind::branch;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
 
         static consteval int64_t bits_at( int64_t ) { return 1; }       // the condition bit; the taken side is accounted per path
 
@@ -1771,6 +1811,8 @@ namespace serialize
         using else_list = ElseFields;
 
         static constexpr field_kind kind = field_kind::branch_on;
+        using writes = schema_detail::path_list<>;
+        using referenced = schema_detail::member_path<Member>;
 
         static consteval int64_t bits_at( int64_t ) { return 0; }       // back reference: no wire bits
 
@@ -1800,6 +1842,8 @@ namespace serialize
         using cases = case_pack<Cases...>;
 
         static constexpr field_kind kind = field_kind::match;
+        using writes = schema_detail::path_list<>;
+        using referenced = schema_detail::member_path<Member>;
 
         static consteval int64_t bits_at( int64_t ) { return 0; }       // back reference: no wire bits
 
@@ -1819,6 +1863,7 @@ namespace serialize
         template <typename X> struct field_list_of;
         template <auto M, typename InnerFlat, typename Seq> struct expand_array;
 
+
         template <auto Outer, typename List> struct wrap;
         template <auto Outer, typename... Fs> struct wrap<Outer, fields<Fs...>> { using type = fields<nest<Outer, Fs>...>; };
         template <auto Outer, typename List> using wrap_t = typename wrap<Outer, List>::type;
@@ -1828,6 +1873,7 @@ namespace serialize
             using object_type = typename member_traits<decltype(Outer)>::object_type;
 
             static constexpr field_kind kind = field_kind::leaf;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
 
             static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
 
@@ -1848,6 +1894,7 @@ namespace serialize
 
             static constexpr field_kind kind = field_kind::bytes;
             static constexpr int64_t num_bytes = F::num_bytes;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
 
             static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
 
@@ -1862,6 +1909,7 @@ namespace serialize
             using else_list = wrap_t<Outer, typename F::else_list>;
 
             static constexpr field_kind kind = field_kind::branch;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
 
             static consteval int64_t bits_at( int64_t ) { return 1; }
 
@@ -1876,6 +1924,8 @@ namespace serialize
             using else_list = wrap_t<Outer, typename F::else_list>;
 
             static constexpr field_kind kind = field_kind::branch_on;
+            using writes = path_list<>;
+            using referenced = typename path_prepend<typename F::referenced, Outer>::type;
 
             static consteval int64_t bits_at( int64_t ) { return 0; }
 
@@ -1896,6 +1946,8 @@ namespace serialize
             using cases = typename wrap_cases<Outer, typename F::cases>::type;
 
             static constexpr field_kind kind = field_kind::match;
+            using writes = path_list<>;
+            using referenced = typename path_prepend<typename F::referenced, Outer>::type;
 
             static consteval int64_t bits_at( int64_t ) { return 0; }
 
@@ -1915,6 +1967,7 @@ namespace serialize
             using object_type = typename member_traits<decltype(Member)>::object_type;
 
             static constexpr field_kind kind = field_kind::leaf;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
 
             static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
 
@@ -1935,6 +1988,7 @@ namespace serialize
 
             static constexpr field_kind kind = field_kind::bytes;
             static constexpr int64_t num_bytes = F::num_bytes;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
 
             static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
 
@@ -1949,6 +2003,7 @@ namespace serialize
             using else_list = wrap_at_t<Member, Index, typename F::else_list>;
 
             static constexpr field_kind kind = field_kind::branch;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
 
             static consteval int64_t bits_at( int64_t ) { return 1; }
 
@@ -1963,6 +2018,7 @@ namespace serialize
             using element_type = std::remove_extent_t<typename member_traits<decltype(Member)>::value_type>;
 
             static constexpr field_kind kind = field_kind::leaf;
+            using writes = path_list<typename path_prepend<member_path<Index>, Member>::type>;
 
             static consteval int64_t bits_at( int64_t ) { return Bits; }
 
@@ -2047,6 +2103,7 @@ namespace serialize
         static_assert( max_count <= 16, "array_n generates one specialized path per possible count: keep the maximum count small (use the streams for large collections)" );
 
         static constexpr field_kind kind = field_kind::counted;
+        using writes = schema_detail::path_list<schema_detail::member_path<CountMember>>;
         static constexpr int count_bits = bits_required( 0, uint32_t( max_count ) );
 
         static consteval int64_t bits_at( int64_t ) { return count_bits; }
@@ -2074,6 +2131,7 @@ namespace serialize
         static_assert( buffer_size >= 2 );
 
         static constexpr field_kind kind = field_kind::dynamic;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
         static constexpr int64_t max_length = buffer_size - 1;
         static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
 
@@ -2098,6 +2156,7 @@ namespace serialize
         using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
 
         static constexpr field_kind kind = field_kind::dynamic;
+        using writes = schema_detail::path_list<schema_detail::member_path<DataMember>, schema_detail::member_path<CountMember>>;
         static constexpr int64_t max_length = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(DataMember)>::value_type> );
         static_assert( max_length >= 1 );
         static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
@@ -2540,6 +2599,71 @@ namespace serialize
             }
         };
 
+        // back reference validation: walk the flattened schema in serialization order, accumulating
+        // the member paths that are serialized UNCONDITIONALLY. every branch_on/match must reference
+        // an accumulated path: back references only — never a forward reference, and never a member
+        // whose serialization depends on a branch outcome or an array count.
+        template <typename Seen, typename List> struct ref_check;
+
+        template <typename Seen, typename F, field_kind Kind = F::kind> struct ref_step
+        {
+            // leaf, bytes, dynamic: unconditional writes accumulate
+            static constexpr bool ok = true;
+            using seen_after = typename paths_concat<Seen, typename F::writes>::type;
+        };
+
+        template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::branch>
+        {
+            using seen_cond = typename paths_concat<Seen, typename F::writes>::type;    // the condition bit is written before the sides
+            static constexpr bool ok = ref_check<seen_cond, typename F::then_list>::ok
+                                    && ref_check<seen_cond, typename F::else_list>::ok;
+            using seen_after = seen_cond;                                               // side writes are conditional: not visible afterwards
+        };
+
+        template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::branch_on>
+        {
+            static constexpr bool ok = path_in<typename F::referenced, Seen>::value
+                                    && ref_check<Seen, typename F::then_list>::ok
+                                    && ref_check<Seen, typename F::else_list>::ok;
+            using seen_after = Seen;
+        };
+
+        template <typename Seen, typename CasePack> struct ref_check_cases;
+        template <typename Seen> struct ref_check_cases<Seen, case_pack<>>
+        {
+            static constexpr bool ok = true;
+        };
+        template <typename Seen, typename C0, typename... Cs> struct ref_check_cases<Seen, case_pack<C0, Cs...>>
+        {
+            static constexpr bool ok = ref_check<Seen, typename C0::list>::ok
+                                    && ref_check_cases<Seen, case_pack<Cs...>>::ok;
+        };
+
+        template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::match>
+        {
+            static constexpr bool ok = path_in<typename F::referenced, Seen>::value
+                                    && ref_check_cases<Seen, typename F::cases>::ok;
+            using seen_after = Seen;
+        };
+
+        template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::counted>
+        {
+            using seen_count = typename paths_concat<Seen, typename F::writes>::type;   // the count is written before the elements
+            static constexpr bool ok = ref_check<seen_count, typename F::template elements<F::max_count>>::ok;
+            using seen_after = seen_count;                                              // element writes depend on the count: not visible afterwards
+        };
+
+        template <typename Seen> struct ref_check<Seen, fields<>>
+        {
+            static constexpr bool ok = true;
+        };
+
+        template <typename Seen, typename F, typename... Rest> struct ref_check<Seen, fields<F, Rest...>>
+        {
+            using step = ref_step<Seen, F>;
+            static constexpr bool ok = step::ok && ref_check<typename step::seen_after, fields<Rest...>>::ok;
+        };
+
         template <typename T, typename List> struct runner_of;
         template <typename T, typename... Fs> struct runner_of<T, fields<Fs...>> { using type = runner<T, 0, 0, Fs...>; };
 
@@ -2551,8 +2675,22 @@ namespace serialize
         A compile time packet schema: a list of fields serialized in order with constant offsets.
         @see bits, int_, int64, bool_, float_, double_, align, bytes, branch, object
      */
+    /**
+        True if every branch_on and match in the field list references a member path serialized
+        unconditionally EARLIER in the schema. Back references only: forward references, references
+        to members that are never serialized, and references to members whose serialization depends
+        on a branch outcome or an array count are all rejected. schema<> static_asserts this, so an
+        invalid schema fails to compile — on every compiler, at every optimization level.
+     */
+    template <typename... Fields>
+    inline constexpr bool valid_references =
+        schema_detail::ref_check<schema_detail::path_list<>, schema_detail::flatten_t<fields<Fields...>>>::ok;
+
     template <typename FirstField, typename... RestFields> struct schema
     {
+        static_assert( valid_references<FirstField, RestFields...>,
+                       "branch_on/match must reference a member serialized unconditionally EARLIER in the schema: back references only, never forward references" );
+
         /// The flattened field list: object fields spliced in place, only leaf/bytes/branch fields remain.
         using field_list = schema_detail::flatten_t<fields<FirstField, RestFields...>>;
 
@@ -4664,6 +4802,48 @@ using SchemaBackrefSchema = serialize::schema<
 
 // longest path: 1 + 2 + 96 + 96 (velocity) + 32 (float case) + 32 = 259
 static_assert( SchemaBackrefSchema::MaxBits == 259 );
+
+// back references are validated at compile time: valid_references is the trait schema<>
+// static_asserts, so every rejection below would be a compile error inside a schema.
+
+// referencing a member serialized earlier is a back reference: accepted
+static_assert( serialize::valid_references<
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity>,
+    serialize::branch_on<&SchemaBackrefPacket::hasVelocity, serialize::fields<>, serialize::fields<>> > );
+
+// referencing a member serialized LATER is a forward reference: rejected
+static_assert( !serialize::valid_references<
+    serialize::branch_on<&SchemaBackrefPacket::hasVelocity, serialize::fields<>, serialize::fields<>>,
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity> > );
+
+// referencing a member that is never serialized: rejected
+static_assert( !serialize::valid_references<
+    serialize::bits<&SchemaBackrefPacket::type, 2>,
+    serialize::branch_on<&SchemaBackrefPacket::hasVelocity, serialize::fields<>, serialize::fields<>> > );
+
+// a member serialized inside one side of a branch is conditional, not guaranteed to be decoded:
+// referencing it after the branch is rejected
+static_assert( !serialize::valid_references<
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity>,
+    serialize::branch<&SchemaBackrefPacket::hasVelocity,
+        serialize::fields< serialize::bits<&SchemaBackrefPacket::type, 2> >,
+        serialize::fields<> >,
+    serialize::match<&SchemaBackrefPacket::type, serialize::case_<1>> > );
+
+// but INSIDE that side the member has been decoded: a back reference within the same side is accepted
+static_assert( serialize::valid_references<
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity>,
+    serialize::branch<&SchemaBackrefPacket::hasVelocity,
+        serialize::fields<
+            serialize::bits<&SchemaBackrefPacket::type, 2>,
+            serialize::match<&SchemaBackrefPacket::type, serialize::case_<1>> >,
+        serialize::fields<> > > );
+
+// a match on an earlier member, referenced through the flattened schema: accepted
+static_assert( serialize::valid_references<
+    serialize::bits<&SchemaBackrefPacket::type, 2>,
+    serialize::match<&SchemaBackrefPacket::type,
+        serialize::case_<1, serialize::bits<&SchemaBackrefPacket::a, 16>>> > );
 
 inline void test_schema_backref()
 {

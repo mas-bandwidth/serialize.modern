@@ -14,12 +14,16 @@
 #
 # Forward branches are expected and allowed: input validation early-outs and compile time if/else.
 #
-# usage: codegen_audit.py <object file>              run the audit
-#        codegen_audit.py --self-test <object file>  verify the rules DETECT violations, against
-#                                                    codegen_audit_bad.cpp's object (a gate that
-#                                                    cannot fail is decoration)
+# usage: codegen_audit.py [--config CFG] [--dumpbin PATH] <object file>
+#        codegen_audit.py --self-test [...] <object file>
 #
-# Supports arm64 and x86-64 objects (ELF and Mach-O), disassembled with objdump.
+#   --config CFG    skip (exit 0) unless CFG is Release: multi-config generators (MSVC) register
+#                   the test for every configuration, and the audit is only meaningful optimized
+#   --dumpbin PATH  disassemble with MSVC dumpbin /DISASM instead of nm+objdump
+#   --self-test     verify the rules DETECT violations, against codegen_audit_bad.cpp's object
+#                   (a gate that cannot fail is decoration)
+#
+# Supports arm64 and x86-64 objects: ELF and Mach-O via objdump, COFF via dumpbin.
 
 import re
 import subprocess
@@ -90,6 +94,26 @@ def function_bodies( path, names ):
     return bodies
 
 
+def function_bodies_dumpbin( path, names, dumpbin ):
+    """name -> ordered list of (address, mnemonic, operands), parsed from dumpbin /DISASM"""
+    bodies = {}
+    current = None
+    for line in run( [ dumpbin, "/NOLOGO", "/DISASM", path ] ).splitlines():
+        label = re.match( r"^(\S+):\s*$", line )
+        if label:
+            name = label.group( 1 )
+            current = name if name in names else None
+            if current is not None:
+                bodies[current] = []
+            continue
+        if current is None:
+            continue
+        insn = re.match( r"^  ([0-9a-fA-F]+):(?:\s+[0-9a-fA-F]{2})+\s{2,}(\S+)\s*(.*)$", line )
+        if insn:
+            bodies[current].append( ( int( insn.group( 1 ), 16 ), insn.group( 2 ), insn.group( 3 ) ) )
+    return bodies
+
+
 def branch_target( operands ):
     """the destination address of a direct branch, or None if there is no literal target"""
     match = re.search( r"\b0?x?([0-9a-fA-F]+)\s*(?:<|$)", operands.strip() )
@@ -112,7 +136,9 @@ def audit_function( name, body, profile="fixed" ):
             violations.append( f"indirect branch at {address:#x}: {mnemonic} {operands}" )
         elif mnemonic.startswith( BRANCH_PREFIXES ):
             target = branch_target( operands )
-            if target is not None and target <= address:
+            if target is None:
+                violations.append( f"indirect branch at {address:#x}: {mnemonic} {operands}" )
+            elif target <= address:
                 if profile == "fixed":
                     violations.append( f"backward branch (loop) at {address:#x}: {mnemonic} {operands}" )
     budget = AUDITS.get( name, ( None, ) )[0]
@@ -121,17 +147,39 @@ def audit_function( name, body, profile="fixed" ):
     return violations
 
 
+def get_flag( flag ):
+    if flag in sys.argv:
+        index = sys.argv.index( flag )
+        if index + 1 < len( sys.argv ):
+            return sys.argv[index + 1]
+    return None
+
+
 def main():
     self_test = "--self-test" in sys.argv
-    paths = [ a for a in sys.argv[1:] if not a.startswith( "--" ) ]
+    config = get_flag( "--config" )
+    dumpbin = get_flag( "--dumpbin" )
+    consumed = { "--self-test" }
+    if config is not None: consumed |= { "--config", config }
+    if dumpbin is not None: consumed |= { "--dumpbin", dumpbin }
+    paths = [ a for a in sys.argv[1:] if a not in consumed ]
     if len( paths ) != 1:
-        print( "usage: codegen_audit.py [--self-test] <object file>" )
+        print( "usage: codegen_audit.py [--self-test] [--config CFG] [--dumpbin PATH] <object file>" )
         return 1
     path = paths[0]
 
+    if config is not None and config != "Release":
+        print( f"codegen audit skipped: only meaningful in Release builds (this is {config})" )
+        return 0
+
+    def bodies_for( names ):
+        if dumpbin is not None:
+            return function_bodies_dumpbin( path, names, dumpbin )
+        return function_bodies( path, names )
+
     if self_test:
         # the rules must detect the deliberate violations in codegen_audit_bad.cpp
-        bodies = function_bodies( path, { "audit_bad_function" } )
+        bodies = bodies_for( { "audit_bad_function" } )
         if "audit_bad_function" not in bodies:
             print( "self-test FAILED: audit_bad_function not found in object" )
             return 1
@@ -144,7 +192,7 @@ def main():
         print( f"self-test FAILED: expected a call and a loop to be detected, got: {violations}" )
         return 1
 
-    bodies = function_bodies( path, set( AUDITS.keys() ) )
+    bodies = bodies_for( set( AUDITS.keys() ) )
     missing = set( AUDITS.keys() ) - set( bodies.keys() )
     if missing:
         print( f"codegen audit FAILED: functions not found in object: {sorted( missing )}" )

@@ -128,15 +128,25 @@ if(SERIALIZE_BUILD_TESTS AND SERIALIZE_WIRE_COMPAT_CLASSIC_DIR)
 endif()
 
 # codegen audit gate. compile time schemas promise zero runtime overhead, and this enforces it
-# from PR to PR: codegen_audit.py disassembles the schema Read/Write functions in codegen_audit.cpp
-# and fails on call instructions, loops, indirect branches or instruction count blowups. only
-# meaningful with optimization, and the parser understands arm64 and x86-64 (ELF and Mach-O), so
-# it registers on non-cross Release builds for those architectures. the self test runs the same
-# rules against deliberately bad code and passes only if violations are detected: the gate can fail.
-if(SERIALIZE_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MSVC AND NOT CMAKE_CROSSCOMPILING
-   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|arm64|aarch64)$")
+# from PR to PR across the whole compiler suite: codegen_audit.py disassembles the schema
+# Read/Write functions in codegen_audit.cpp and fails on call instructions, loops, indirect
+# branches or instruction count blowups. GCC and clang objects parse via nm+objdump, MSVC via
+# dumpbin /DISASM; multi-config generators register the test for every configuration and the
+# script skips anything but Release (the audit is only meaningful optimized). registers on
+# non-cross x86-64/arm64 builds; the big-endian s390x job is excluded on purpose — it exists to
+# prove wire correctness, and auditing s390x mnemonics would buy nothing more. the self test runs
+# the same rules against deliberately bad code and passes only if violations are detected: the
+# gate can fail.
+if(SERIALIZE_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|arm64|aarch64|ARM64)$"
+   AND (CMAKE_CONFIGURATION_TYPES OR CMAKE_BUILD_TYPE STREQUAL "Release"))
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
+        set(SERIALIZE_AUDIT_ARGS --config $<CONFIG>)
+        if(MSVC)
+            get_filename_component(SERIALIZE_MSVC_BIN_DIR ${CMAKE_CXX_COMPILER} DIRECTORY)
+            list(APPEND SERIALIZE_AUDIT_ARGS --dumpbin ${SERIALIZE_MSVC_BIN_DIR}/dumpbin.exe)
+        endif()
         add_library(codegen_audit_obj OBJECT codegen_audit.cpp serialize.h)
         target_link_libraries(codegen_audit_obj PRIVATE serialize)
         target_compile_features(codegen_audit_obj PRIVATE cxx_std_23)
@@ -146,8 +156,8 @@ if(SERIALIZE_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MSVC AN
         add_library(codegen_audit_bad_obj OBJECT codegen_audit_bad.cpp)
         target_compile_options(codegen_audit_bad_obj PRIVATE ${SERIALIZE_DEV_FLAGS})
 
-        add_test(NAME codegen_audit COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py $<TARGET_OBJECTS:codegen_audit_obj>)
-        add_test(NAME codegen_audit_selftest COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py --self-test $<TARGET_OBJECTS:codegen_audit_bad_obj>)
+        add_test(NAME codegen_audit COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py ${SERIALIZE_AUDIT_ARGS} $<TARGET_OBJECTS:codegen_audit_obj>)
+        add_test(NAME codegen_audit_selftest COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py --self-test ${SERIALIZE_AUDIT_ARGS} $<TARGET_OBJECTS:codegen_audit_bad_obj>)
     endif()
 endif()
 
