@@ -231,6 +231,34 @@ Third red/blue round (July 2026, capacity and the compile-time cliff):
   offending member in constraint messages (needs C++26 user-generated
   static_assert messages — revisit with reflection).
 
+Fourth red/blue round (July 2026, structural coherence):
+
+- **Accepted: duplicate write detection.** The copy-paste bug compiled:
+  `float_<&Vec::x>, float_<&Vec::y>, float_<&Vec::y>` — y serialized
+  twice, z never, read validates fine and z silently never round-trips.
+  Only the schema can catch this (streams cannot see repetition). A
+  `unique` flag now threads through the existing ref_check walk (same
+  instantiations as valid_references, near-zero compile cost): each
+  field's writes must be disjoint from the accumulated Seen list.
+  Exclusive branch/match sides restart from the same Seen, so both sides
+  writing one member is allowed — pinned positive and negative by
+  static_asserts on `serialize::unique_writes` (public trait) and
+  schema<> static_asserts it. Limitation: the check is path-identity
+  based — overlapping but differently shaped accesses (bytes over a whole
+  array vs its expanded elements) do not collide.
+- **Accepted: object type coherence.** Mixing members of two structs in
+  one schema failed before, but with "no matching function for call to
+  'write'" plus 17 lines of template context. schema<> now static_asserts
+  same_object_type over the flattened list: a named one-line error
+  ("nest inner objects with object<>").
+- **Red claim killed by experiment**: "int_relative_'s back reference is
+  never validated — no ref_step specialization exists." False: the
+  specialization lives next to relative_dispatch in the runner section
+  (line ~3413), far from the other ref_steps — easy to miss reading
+  top-down, but `valid_references` over a dangling prev already returns
+  false. Do not re-claim without a failing test; the machinery walk is
+  split across the file by dependency order, not by topic.
+
 Benchmark epistemology, learned the hard way:
 
 - The classic fixed-width bitpacker benchmark flatters whichever design the

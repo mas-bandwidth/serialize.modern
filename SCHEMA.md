@@ -90,6 +90,12 @@ member type, an `int_` range an `int8_t` member cannot hold, an `array_n` count 
 member's capacity — each is a compile error, because a legal wire value that truncates on
 assignment would be silent corruption that *passes* read validation.
 
+The schema's shape is checked as well. Serializing the same member twice — the copy-paste bug
+that writes `y` two times and `z` never — is a compile error (`serialize::unique_writes` is the
+trait); members on exclusive `branch`/`match` sides do not collide, since only one side executes.
+And all fields must serialize members of a single object type — inner structs compose through
+`object<>` — so mixing two packet types in one schema is a named error, not a template trace.
+
 
 ### Integers and scalars
 

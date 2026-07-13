@@ -3255,12 +3255,26 @@ namespace serialize
         // the member paths that are serialized UNCONDITIONALLY. every branch_on/match must reference
         // an accumulated path: back references only — never a forward reference, and never a member
         // whose serialization depends on a branch outcome or an array count.
+        // duplicate write detection shares the same walk: no member path may be serialized twice
+        // along one wire path. exclusive branch/match sides each restart from the same Seen, so a
+        // member written on both sides is fine — only genuine copy-paste duplicates collide.
+        template <typename Writes, typename Seen> struct paths_disjoint;
+        template <typename Seen> struct paths_disjoint<path_list<>, Seen>
+        {
+            static constexpr bool value = true;
+        };
+        template <typename P, typename... Ps, typename Seen> struct paths_disjoint<path_list<P, Ps...>, Seen>
+        {
+            static constexpr bool value = !path_in<P, Seen>::value && paths_disjoint<path_list<Ps...>, Seen>::value;
+        };
+
         template <typename Seen, typename List> struct ref_check;
 
         template <typename Seen, typename F, field_kind Kind = F::kind> struct ref_step
         {
             // leaf, bytes, dynamic: unconditional writes accumulate
             static constexpr bool ok = true;
+            static constexpr bool unique = paths_disjoint<typename F::writes, Seen>::value;
             using seen_after = typename paths_concat<Seen, typename F::writes>::type;
         };
 
@@ -3269,6 +3283,9 @@ namespace serialize
             using seen_cond = typename paths_concat<Seen, typename F::writes>::type;    // the condition bit is written before the sides
             static constexpr bool ok = ref_check<seen_cond, typename F::then_list>::ok
                                     && ref_check<seen_cond, typename F::else_list>::ok;
+            static constexpr bool unique = paths_disjoint<typename F::writes, Seen>::value
+                                        && ref_check<seen_cond, typename F::then_list>::unique
+                                        && ref_check<seen_cond, typename F::else_list>::unique;
             using seen_after = seen_cond;                                               // side writes are conditional: not visible afterwards
         };
 
@@ -3277,6 +3294,8 @@ namespace serialize
             static constexpr bool ok = path_in<typename F::referenced, Seen>::value
                                     && ref_check<Seen, typename F::then_list>::ok
                                     && ref_check<Seen, typename F::else_list>::ok;
+            static constexpr bool unique = ref_check<Seen, typename F::then_list>::unique
+                                        && ref_check<Seen, typename F::else_list>::unique;
             using seen_after = Seen;
         };
 
@@ -3284,17 +3303,21 @@ namespace serialize
         template <typename Seen> struct ref_check_cases<Seen, case_pack<>>
         {
             static constexpr bool ok = true;
+            static constexpr bool unique = true;
         };
         template <typename Seen, typename C0, typename... Cs> struct ref_check_cases<Seen, case_pack<C0, Cs...>>
         {
             static constexpr bool ok = ref_check<Seen, typename C0::list>::ok
                                     && ref_check_cases<Seen, case_pack<Cs...>>::ok;
+            static constexpr bool unique = ref_check<Seen, typename C0::list>::unique
+                                        && ref_check_cases<Seen, case_pack<Cs...>>::unique;
         };
 
         template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::match>
         {
             static constexpr bool ok = path_in<typename F::referenced, Seen>::value
                                     && ref_check_cases<Seen, typename F::cases>::ok;
+            static constexpr bool unique = ref_check_cases<Seen, typename F::cases>::unique;
             using seen_after = Seen;
         };
 
@@ -3302,18 +3325,22 @@ namespace serialize
         {
             using seen_count = typename paths_concat<Seen, typename F::writes>::type;   // the count is written before the elements
             static constexpr bool ok = ref_check<seen_count, typename F::template elements<F::max_count>>::ok;
+            static constexpr bool unique = paths_disjoint<typename F::writes, Seen>::value
+                                        && ref_check<seen_count, typename F::template elements<F::max_count>>::unique;
             using seen_after = seen_count;                                              // element writes depend on the count: not visible afterwards
         };
 
         template <typename Seen> struct ref_check<Seen, fields<>>
         {
             static constexpr bool ok = true;
+            static constexpr bool unique = true;
         };
 
         template <typename Seen, typename F, typename... Rest> struct ref_check<Seen, fields<F, Rest...>>
         {
             using step = ref_step<Seen, F>;
             static constexpr bool ok = step::ok && ref_check<typename step::seen_after, fields<Rest...>>::ok;
+            static constexpr bool unique = step::unique && ref_check<typename step::seen_after, fields<Rest...>>::unique;
         };
 
         // one fully constant path per bucket of an int_relative_ field. read walks the header bits
@@ -3413,6 +3440,7 @@ namespace serialize
         template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::relative>
         {
             static constexpr bool ok = path_in<typename F::referenced, Seen>::value;
+            static constexpr bool unique = paths_disjoint<typename F::writes, Seen>::value;
             using seen_after = typename paths_concat<Seen, typename F::writes>::type;
         };
 
@@ -3434,6 +3462,25 @@ namespace serialize
         {
             using type = typename first_object_type<fields<Fs...>>::type;
         };
+
+        // every field that names an object type must agree with the schema's: mixing members of
+        // different structs in one field list is a named compile error, not a template trace.
+        template <typename T, typename List> struct same_object_type;
+        template <typename T> struct same_object_type<T, fields<>>
+        {
+            static constexpr bool value = true;
+        };
+        template <typename T, typename F, typename... Fs> requires names_object_type<F>
+        struct same_object_type<T, fields<F, Fs...>>
+        {
+            static constexpr bool value = std::is_same_v<T, typename F::object_type>
+                                       && same_object_type<T, fields<Fs...>>::value;
+        };
+        template <typename T, typename F, typename... Fs> requires ( !names_object_type<F> )
+        struct same_object_type<T, fields<F, Fs...>>
+        {
+            static constexpr bool value = same_object_type<T, fields<Fs...>>::value;
+        };
     }
 
     /**
@@ -3453,16 +3500,32 @@ namespace serialize
     inline constexpr bool valid_references =
         schema_detail::ref_check<schema_detail::path_list<>, schema_detail::flatten_t<fields<Fields...>>>::ok;
 
+    /**
+        True if no member path is serialized more than once along any single wire path. Members
+        written on exclusive branch/match sides do not collide — only one side executes — but the
+        classic copy-paste bug (one member serialized twice, its neighbor never) is rejected.
+        schema<> static_asserts this.
+     */
+    template <typename... Fields>
+    inline constexpr bool unique_writes =
+        schema_detail::ref_check<schema_detail::path_list<>, schema_detail::flatten_t<fields<Fields...>>>::unique;
+
     template <typename FirstField, typename... RestFields> struct schema
     {
         static_assert( valid_references<FirstField, RestFields...>,
                        "branch_on/match must reference a member serialized unconditionally EARLIER in the schema: back references only, never forward references" );
+
+        static_assert( unique_writes<FirstField, RestFields...>,
+                       "schema serializes the same member more than once (copy-paste error?): only exclusive branch/match sides may write the same member" );
 
         /// The flattened field list: object and array fields spliced in place with composed accessors,
         /// leaving only fields the runner executes directly.
         using field_list = schema_detail::flatten_t<fields<FirstField, RestFields...>>;
 
         using object_type = typename schema_detail::first_object_type<field_list>::type;
+
+        static_assert( schema_detail::same_object_type<object_type, field_list>::value,
+                       "schema fields serialize members of different object types: nest inner objects with object<>" );
 
     private:
 
@@ -5815,6 +5878,17 @@ static_assert( !serialize::valid_references<
 static_assert( !serialize::valid_references<
     serialize::bits<&SchemaBackrefPacket::type, 2>,
     serialize::branch_on<&SchemaBackrefPacket::hasVelocity, serialize::fields<>, serialize::fields<>> > );
+
+// duplicate member writes are rejected: the copy-paste bug that serializes one member twice and
+// its neighbor never. members on exclusive branch/match sides do not collide.
+static_assert( !serialize::unique_writes<
+    serialize::bits<&SchemaBackrefPacket::type, 2>,
+    serialize::bits<&SchemaBackrefPacket::type, 2> > );
+static_assert( serialize::unique_writes<
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity>,
+    serialize::branch_on<&SchemaBackrefPacket::hasVelocity,
+        serialize::fields< serialize::bits<&SchemaBackrefPacket::type, 2> >,
+        serialize::fields< serialize::bits<&SchemaBackrefPacket::type, 2> > > > );
 
 // a member serialized inside one side of a branch is conditional, not guaranteed to be decoded:
 // referencing it after the branch is rejected
