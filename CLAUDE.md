@@ -25,10 +25,10 @@ Header-only is intentional (heavily templated serialize methods), and the
 header is self-contained: including it into a translation unit with no prior
 includes must compile. Requires C++23 (`<bit>`, `std::bit_cast`,
 `std::byteswap`, `std::endian`, `if constexpr` macros). The API is classic's
-(same classes, same serialize_* macros — classic's read_*/write_* macro
-families are removed: for split read/write functions, alias
-`using Stream = serialize::ReadStream` and the serialize_* macros work
-unchanged), plus
+(same classes, same serialize_* / read_* / write_* macros — the macro
+families were briefly removed during development and restored by owner
+decision: classic API compatibility matters more than trimming surface;
+their internal temporaries use the hygienic serialize_temp_* names), plus
 `WriteBits64`/`ReadBits64`/`SerializeBits64` for [1,64] bit values, plus
 compile time schemas (`serialize::schema`): fixed-layout packets described as
 types, with constant-offset generated code, compile time if/else
