@@ -44,6 +44,9 @@ AUDITS = {
     "audit_body_write": ( 90, "fixed" ),
     "audit_dynamic_read": ( 600, "dynamic" ),      # measured: 175 clang arm64, 191 gcc arm64
     "audit_dynamic_write": ( 600, "dynamic" ),     # measured: 204 clang arm64, 241 gcc arm64
+    "audit_fixed_measure": ( 24, "fixed" ),        # measured: 2 clang arm64 (mov #const; ret)
+    "audit_body_measure": ( 24, "fixed" ),         # measured: 6 clang arm64
+    "audit_dynamic_measure": ( 150, "dynamic" ),   # measured: 19 clang arm64 (strlen for the string field)
 }
 
 CALL_MNEMONICS = { "bl", "blr", "call", "callq" }

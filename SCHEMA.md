@@ -221,5 +221,7 @@ against. Schema and stream code can be mixed freely: the bytes are identical.
 For every field the wire format is identical to the equivalent `serialize_*` calls, field for
 field — with the single documented exception of `wstring_`'s alignment, above. This is pinned by
 tests that write each schema and its hand-written stream twin and require identical bytes, decode
-each with the other, and reject the same malformed inputs. The library-level wire format is
-additionally pinned against classic serialize by a byte-identity CI gate on every pull request.
+each with the other, and reject the same malformed inputs — the last claim pinned the brute
+force way, by a test that flips every bit of a valid composed packet and requires both readers to
+agree on the verdict and on the decoded packet. The library-level wire format is additionally
+pinned against classic serialize by a byte-identity CI gate on every pull request.

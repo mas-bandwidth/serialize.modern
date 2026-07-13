@@ -6507,6 +6507,61 @@ inline void test_schema_composed()
     }
 }
 
+// schema and stream twins must reject the same malformed inputs, not just produce the same valid
+// bytes. pin it the brute force way: flip every bit of a valid composed packet and require the
+// schema read and the macro twin read to agree on the verdict — and where both accept, to have
+// decoded the same packet (compared by re-encoding, so float bits and every branch are covered).
+inline void test_schema_reject_parity()
+{
+    SchemaMissionPacket packet;
+    memset( (void*) &packet, 0, sizeof( packet ) );
+    packet.gadgets[0].powered = true;
+    packet.gadgets[0].charge = 42.5f;
+    packet.gadgets[0].style = 1;
+    packet.gadgets[0].bonus = 0xAB;
+    packet.gadgets[1].powered = false;
+    packet.gadgets[1].style = 2;
+    packet.gadgets[1].bonus = 0xCD;
+    packet.progress.start = 100;
+    packet.progress.finish = 4100;
+    packet.progress.mark_count = 2;
+    packet.progress.marks[0].x = 1.0f;
+    packet.progress.marks[1].x = 2.0f;
+    packet.tail = 0xBEE;
+
+    uint8_t buffer[96 + 8] = { 0 };
+    const int64_t bytesWritten = SchemaMissionSchema::Write( buffer, 96, packet );
+    serialize_check( bytesWritten > 0 );
+
+    for ( int64_t bit = 0; bit < bytesWritten * 8; bit++ )
+    {
+        uint8_t mutated[96 + 8] = { 0 };
+        memcpy( mutated, buffer, (size_t) bytesWritten );
+        mutated[bit / 8] ^= uint8_t( 1 << ( bit % 8 ) );
+
+        SchemaMissionPacket schemaOut;
+        memset( (void*) &schemaOut, 0, sizeof( schemaOut ) );
+        const bool schemaOk = SchemaMissionSchema::Read( mutated, bytesWritten, schemaOut );
+
+        SchemaMissionPacket streamOut;
+        memset( (void*) &streamOut, 0, sizeof( streamOut ) );
+        serialize::ReadStream readStream( mutated, bytesWritten );
+        const bool streamOk = streamOut.Serialize( readStream );
+
+        serialize_check( schemaOk == streamOk );
+
+        if ( schemaOk )
+        {
+            uint8_t a[96 + 8] = { 0 };
+            uint8_t b[96 + 8] = { 0 };
+            const int64_t na = SchemaMissionSchema::Write( a, 96, schemaOut );
+            const int64_t nb = SchemaMissionSchema::Write( b, 96, streamOut );
+            serialize_check( na == nb );
+            serialize_check( memcmp( a, b, (size_t) na ) == 0 );
+        }
+    }
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -6768,6 +6823,7 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_nested_dynamic );
         SERIALIZE_RUN_TEST( test_schema_array_n_bounds );
         SERIALIZE_RUN_TEST( test_schema_composed );
+        SERIALIZE_RUN_TEST( test_schema_reject_parity );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

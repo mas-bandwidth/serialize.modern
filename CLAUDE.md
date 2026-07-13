@@ -47,7 +47,7 @@ ASan+UBSan and libFuzzer jobs on Linux, a big-endian s390x job under QEMU,
 and a codegen audit (Release, all three compilers: GCC and clang via
 nm+objdump, MSVC via dumpbin /DISASM; s390x is excluded on purpose — that
 job proves wire correctness, not codegen): codegen_audit.py disassembles
-the schema Read/Write functions and fails the build on call instructions,
+the schema Read/Write/MeasureBits functions and fails the build on call instructions,
 loops, indirect branches or instruction count blowups — the zero-overhead
 schema property is a gated invariant, not an aspiration. Its self test runs
 the same rules against deliberately bad code, so the gate provably can fail. To run the wire gate locally:
@@ -78,7 +78,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 28 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 29 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
@@ -258,6 +258,29 @@ Fourth red/blue round (July 2026, structural coherence):
   top-down, but `valid_references` over a dangling prev already returns
   false. Do not re-claim without a failing test; the machinery walk is
   split across the file by dependency order, not by topic.
+
+Fifth red/blue round (July 2026, runtime contracts and gate blind spots):
+
+- **Accepted: MeasureBits joined the codegen audit.** It was ungated — it
+  could have regressed to a runtime schema walk and no gate would notice.
+  Measured first: fixed-layout measure folds to `mov #const; ret` (2
+  instructions), the branchy body packet to 6, the dynamic packet to 19
+  including a strlen for the string field. Budgets 24/24/150, dynamic
+  profile for the strlen.
+- **Accepted: rejection parity pinned.** SCHEMA.md claimed schema and
+  stream twins "reject the same malformed inputs" — true but untested
+  (the fuzz differential cross-reads valid data). test_schema_reject_parity
+  now flips every bit of a valid composed packet (arrays, branch, match,
+  int_relative_, array_n) and requires identical verdicts from both
+  readers, and identical decoded packets (compared by re-encoding) where
+  both accept. Parity held on the first run; now it cannot silently break.
+- **Rejected: hardening the serialize_* macros with the schema's type
+  checks.** serialize_bits on a float member compiles and truncates — in
+  classic AND modern, byte-for-byte the same behavior. Rejecting it here
+  would make modern refuse code classic accepts, re-breaking the
+  compatibility the macro restoration exists to provide. Deliberate
+  two-tier design: the macros are classic's surface verbatim; static
+  safety lives in the schema. Do not re-propose macro static_asserts.
 
 Benchmark epistemology, learned the hard way:
 

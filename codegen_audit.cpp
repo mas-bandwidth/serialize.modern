@@ -148,3 +148,20 @@ extern "C" int64_t audit_dynamic_write( uint8_t * data, const AuditDyn & packet 
 {
     return AuditDynSchema::Write( data, AuditDynSchema::MaxBytes, packet );
 }
+
+// MeasureBits is part of the zero-overhead contract too: a fixed-layout measure must fold to a
+// returned constant, a branchy one to a few compares — never a runtime walk of the schema.
+extern "C" int64_t audit_fixed_measure( const AuditPacket & packet )
+{
+    return AuditSchema::MeasureBits( packet );
+}
+
+extern "C" int64_t audit_body_measure( const AuditBody & body )
+{
+    return AuditBodySchema::MeasureBits( body );
+}
+
+extern "C" int64_t audit_dynamic_measure( const AuditDyn & packet )
+{
+    return AuditDynSchema::MeasureBits( packet );
+}
