@@ -25,15 +25,21 @@ import re
 import subprocess
 import sys
 
-# instruction budgets, keyed by unmangled symbol name. roughly 3x the counts measured on Apple
-# clang 21 arm64 (fixed_read 57, fixed_write 33, body_read 29, body_write 28), so compiler and
-# platform drift passes while a structural regression (the ~150+ instruction stream cursor path
-# coming back, per function it is inlined into) fails.
-BUDGETS = {
-    "audit_fixed_read": 180,
-    "audit_fixed_write": 120,
-    "audit_body_read": 90,
-    "audit_body_write": 90,
+# audited functions: (instruction budget, profile). budgets are roughly 3x the counts measured on
+# Apple clang 21 arm64, so compiler and platform drift passes while a structural regression (the
+# ~150+ instruction stream cursor path coming back, per function it is inlined into) fails.
+#
+# profiles:
+#   fixed   - the zero overhead promise: no calls, no loops, no indirect branches, budget
+#   dynamic - runtime-length sections may loop and call (copies, strlen), but the function must
+#             stay within budget and may not use indirect branches
+AUDITS = {
+    "audit_fixed_read": ( 180, "fixed" ),
+    "audit_fixed_write": ( 120, "fixed" ),
+    "audit_body_read": ( 90, "fixed" ),
+    "audit_body_write": ( 90, "fixed" ),
+    "audit_dynamic_read": ( 600, "dynamic" ),      # measured: 175 clang arm64, 191 gcc arm64
+    "audit_dynamic_write": ( 600, "dynamic" ),     # measured: 204 clang arm64, 241 gcc arm64
 }
 
 CALL_MNEMONICS = { "bl", "blr", "call", "callq" }
@@ -95,19 +101,21 @@ def branch_target( operands ):
     return None
 
 
-def audit_function( name, body ):
+def audit_function( name, body, profile="fixed" ):
     violations = []
     for address, mnemonic, operands in body:
         base = mnemonic.split( "." )[0]         # b.ge -> b, jne stays jne
         if base in CALL_MNEMONICS:
-            violations.append( f"call instruction at {address:#x}: {mnemonic} {operands}" )
+            if profile == "fixed":
+                violations.append( f"call instruction at {address:#x}: {mnemonic} {operands}" )
         elif base in INDIRECT_BRANCH_MNEMONICS:
             violations.append( f"indirect branch at {address:#x}: {mnemonic} {operands}" )
         elif mnemonic.startswith( BRANCH_PREFIXES ):
             target = branch_target( operands )
             if target is not None and target <= address:
-                violations.append( f"backward branch (loop) at {address:#x}: {mnemonic} {operands}" )
-    budget = BUDGETS.get( name )
+                if profile == "fixed":
+                    violations.append( f"backward branch (loop) at {address:#x}: {mnemonic} {operands}" )
+    budget = AUDITS.get( name, ( None, ) )[0]
     if budget is not None and len( body ) > budget:
         violations.append( f"instruction count {len( body )} exceeds budget {budget}" )
     return violations
@@ -136,17 +144,18 @@ def main():
         print( f"self-test FAILED: expected a call and a loop to be detected, got: {violations}" )
         return 1
 
-    bodies = function_bodies( path, set( BUDGETS.keys() ) )
-    missing = set( BUDGETS.keys() ) - set( bodies.keys() )
+    bodies = function_bodies( path, set( AUDITS.keys() ) )
+    missing = set( AUDITS.keys() ) - set( bodies.keys() )
     if missing:
         print( f"codegen audit FAILED: functions not found in object: {sorted( missing )}" )
         return 1
 
     failed = False
     for name in sorted( bodies.keys() ):
-        violations = audit_function( name, bodies[name] )
+        budget, profile = AUDITS[name]
+        violations = audit_function( name, bodies[name], profile )
         status = "FAILED" if violations else "ok"
-        print( f"{name}: {len( bodies[name] )} instructions (budget {BUDGETS[name]}) ... {status}" )
+        print( f"{name}: {len( bodies[name] )} instructions (budget {budget}, {profile}) ... {status}" )
         for violation in violations:
             print( f"    {violation}" )
             failed = True

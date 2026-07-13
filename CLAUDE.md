@@ -65,7 +65,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 20 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 22 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
@@ -101,10 +101,21 @@ best-of-5 runs, heap-buffered benchmark). Kept:
   both directions), and 3.6x read with write parity on a small float-only
   packet with an unpredictable 50/50 branch. The runtime bit cursor is the
   stream path's fundamental cost: schemas delete it. Wire-identical output
-  is pinned by test_schema/test_schema_object (memcmp against macro twins,
-  cross-reads both directions), and the zero-overhead codegen is pinned by
-  the codegen_audit CI gate (straight-line call-free code, e.g. the audit
-  packet reads in 57 instructions and writes in 33 on arm64 clang).
+  is pinned by test_schema/test_schema_object/test_schema_array/
+  test_schema_dynamic (memcmp against macro twins, cross-reads both
+  directions), and the zero-overhead codegen is pinned by the codegen_audit
+  CI gate (straight-line call-free code, e.g. the audit packet reads in 57
+  instructions and writes in 33 on arm64 clang).
+- **Loops and variable length in schemas, three strategies, all measured.**
+  array/bits_array unroll fixed counts at compile time. array_n (runtime
+  count, max <= 16) generates one fully constant path per possible count:
+  pure specialization, no runtime cursor. string/bytes_n hand the rest of
+  the schema off to a runtime byte base: shifts and masks stay constants,
+  only the base pointer is a register, the length-bounded copy is the only
+  loop. A packet mixing all three reads at 240 M packets/s vs 61 M on the
+  stream path (3.9x). The codegen audit gates these under a 'dynamic'
+  profile: loops/copy calls allowed, instruction budgets still enforced,
+  fixed-layout schemas stay strict.
 
 Rejected, with measurements — do not re-propose without new evidence:
 

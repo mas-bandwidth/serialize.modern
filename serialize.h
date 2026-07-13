@@ -122,6 +122,8 @@
 #include <cmath>        // ceil, floor
 #include <bit>          // bit_width, byteswap, bit_cast, endian
 #include <concepts>     // unsigned_integral, convertible_to
+#include <type_traits>  // remove_extent
+#include <utility>      // index_sequence
 
 namespace serialize
 {
@@ -1426,8 +1428,10 @@ namespace serialize
         member pointers, so widen them or keep those packets on the streams).
      */
 
-    /// How the schema runner treats a field: an inline bitpacked value, an aligned byte block, or a conditional branch.
-    enum class field_kind { leaf, bytes, branch };
+    /// How the schema runner treats a field: an inline bitpacked value, an aligned byte block, a
+    /// conditional branch, a bounded count with one specialized path per value, or a runtime-length
+    /// section after which the schema continues at a runtime byte offset.
+    enum class field_kind { leaf, bytes, branch, counted, dynamic };
 
     namespace schema_detail
     {
@@ -1761,6 +1765,9 @@ namespace serialize
         template <typename List> struct flatten;
         template <typename List> using flatten_t = typename flatten<List>::type;
 
+        template <typename X> struct field_list_of;
+        template <auto M, typename InnerFlat, typename Seq> struct expand_array;
+
         template <auto Outer, typename List> struct wrap;
         template <auto Outer, typename... Fs> struct wrap<Outer, fields<Fs...>> { using type = fields<nest<Outer, Fs>...>; };
         template <auto Outer, typename List> using wrap_t = typename wrap<Outer, List>::type;
@@ -1811,6 +1818,83 @@ namespace serialize
             static serialize_force_inline void set( object_type & object, bool value ) noexcept { F::set( object.*Outer, value ); }
         };
 
+        // nest_at<Member, Index, F>: the field F of one element of a C array member. this is how
+        // array composes: accessor composition with a compile time element index, no runtime cost.
+        template <auto Member, int64_t Index, typename F, field_kind Kind = F::kind> struct nest_at;
+
+        template <auto Member, int64_t Index, typename List> struct wrap_at;
+        template <auto Member, int64_t Index, typename... Fs> struct wrap_at<Member, Index, fields<Fs...>> { using type = fields<nest_at<Member, Index, Fs>...>; };
+        template <auto Member, int64_t Index, typename List> using wrap_at_t = typename wrap_at<Member, Index, List>::type;
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::leaf>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+
+            static constexpr field_kind kind = field_kind::leaf;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            template <int64_t K> static serialize_force_inline bool read( const uint8_t * data, object_type & object ) noexcept
+            {
+                return F::template read<K>( data, ( object.*Member )[Index] );
+            }
+
+            template <int64_t SegBase, int64_t K> static serialize_force_inline void write( uint8_t * data, uint64_t * words, const object_type & object ) noexcept
+            {
+                F::template write<SegBase, K>( data, words, ( object.*Member )[Index] );
+            }
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::bytes>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+
+            static constexpr field_kind kind = field_kind::bytes;
+            static constexpr int64_t num_bytes = F::num_bytes;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            static serialize_force_inline uint8_t * dst( object_type & object ) noexcept { return F::dst( ( object.*Member )[Index] ); }
+            static serialize_force_inline const uint8_t * src( const object_type & object ) noexcept { return F::src( ( object.*Member )[Index] ); }
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::branch>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+            using then_list = wrap_at_t<Member, Index, typename F::then_list>;
+            using else_list = wrap_at_t<Member, Index, typename F::else_list>;
+
+            static constexpr field_kind kind = field_kind::branch;
+
+            static consteval int64_t bits_at( int64_t ) { return 1; }
+
+            static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( ( object.*Member )[Index] ); }
+            static serialize_force_inline void set( object_type & object, bool value ) noexcept { F::set( ( object.*Member )[Index], value ); }
+        };
+
+        // one element of an unsigned integral array, Bits wide: the leaf bits_array expands into
+        template <auto Member, int64_t Index, int Bits> struct scalar_element
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+            using element_type = std::remove_extent_t<typename member_traits<decltype(Member)>::value_type>;
+
+            static constexpr field_kind kind = field_kind::leaf;
+
+            static consteval int64_t bits_at( int64_t ) { return Bits; }
+
+            template <int64_t K> static serialize_force_inline bool read( const uint8_t * data, object_type & object ) noexcept
+            {
+                ( object.*Member )[Index] = element_type( get_const<K, Bits>( data ) );
+                return true;
+            }
+
+            template <int64_t SegBase, int64_t K> static serialize_force_inline void write( uint8_t *, uint64_t * words, const object_type & object ) noexcept
+            {
+                serialize_assert( Bits == 64 || uint64_t( ( object.*Member )[Index] ) <= ( ( uint64_t(1) << Bits ) - 1 ) );
+                put_const<SegBase, K, Bits>( words, uint64_t( ( object.*Member )[Index] ) );
+            }
+        };
+
         template <typename F, typename List> struct cons;
         template <typename F, typename... Ls> struct cons<F, fields<Ls...>> { using type = fields<F, Ls...>; };
 
@@ -1829,9 +1913,124 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
     };
 
+    /**
+        Serialize a fixed count C array member of structs: the compile time for loop. Inner (a schema
+        or fields list over the element type) is spliced once per element with composed accessors, so
+        the loop is fully unrolled at compile time and every element keeps constant offsets. Count
+        defaults to the array extent. Wire identical to serializing each element in a loop.
+     */
+    template <auto Member, typename Inner,
+              int64_t Count = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> )>
+    struct array
+    {
+        static_assert( Count >= 1 );
+        static_assert( Count <= int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> ) );
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+    };
+
+    /**
+        Serialize a fixed count C array member of unsigned integrals, Bits each: the compile time for
+        loop over scalars. Count defaults to the array extent. Wire identical to serialize_bits per element.
+     */
+    template <auto Member, int Bits,
+              int64_t Count = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> )>
+    struct bits_array
+    {
+        static_assert( Bits >= 1 && Bits <= 64 );
+        static_assert( Count >= 1 );
+        static_assert( Count <= int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> ) );
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+    };
+
+    /**
+        Serialize a runtime-count array: a count member in [0,Max], then that many elements. Max is
+        the items array extent. Wire identical to serialize_int of the count followed by the elements
+        in a loop.
+
+        This is the bounded specialization strategy: the generated code contains one fully constant
+        path per possible count, selected by forward compares — zero overhead is preserved for a
+        runtime count. The cost is code size (each possible count instantiates its elements AND the
+        rest of the schema), so keep Max small (capped at 16) and put counted arrays near the end of
+        the schema. Large or unbounded collections belong on the streams.
+     */
+    template <auto ItemsMember, auto CountMember, typename Inner> struct array_n
+    {
+        using object_type = typename schema_detail::member_traits<decltype(ItemsMember)>::object_type;
+        using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
+
+        static constexpr int64_t max_count = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type> );
+        static_assert( max_count >= 1 );
+        static_assert( max_count <= 16, "array_n generates one specialized path per possible count: keep the maximum count small (use the streams for large collections)" );
+
+        static constexpr field_kind kind = field_kind::counted;
+        static constexpr int count_bits = bits_required( 0, uint32_t( max_count ) );
+
+        static consteval int64_t bits_at( int64_t ) { return count_bits; }
+
+        template <int64_t I> using elements =
+            typename schema_detail::expand_array<ItemsMember, schema_detail::flatten_t<typename schema_detail::field_list_of<Inner>::type>, std::make_index_sequence<size_t( I )>>::type;
+
+        static serialize_force_inline int64_t get_count( const object_type & object ) noexcept { return int64_t( object.*CountMember ); }
+        static serialize_force_inline void set_count( object_type & object, int64_t count ) noexcept { object.*CountMember = count_type( count ); }
+    };
+
+    /**
+        Serialize a string member (a char array): a length in [0,extent-1], alignment to byte, then
+        the characters. Wire identical to serialize_string with the same buffer size.
+
+        This is the runtime-base strategy: the length is runtime, so after the characters the rest of
+        the schema continues at a runtime byte offset — a fresh compile time run relative to a base
+        register. Shifts and masks stay compile time constants; the copy itself is the only loop.
+     */
+    template <auto Member> struct string
+    {
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static constexpr int64_t buffer_size = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> );
+        static_assert( buffer_size >= 2 );
+
+        static constexpr field_kind kind = field_kind::dynamic;
+        static constexpr int64_t max_length = buffer_size - 1;
+        static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
+
+        static consteval int64_t bits_at( int64_t K ) { return length_bits + schema_detail::align_pad( K + length_bits ) + max_length * 8; }
+
+        static serialize_force_inline uint8_t * dst( object_type & object ) noexcept { return (uint8_t*) ( object.*Member ); }
+        static serialize_force_inline const uint8_t * src( const object_type & object ) noexcept { return (const uint8_t*) ( object.*Member ); }
+
+        static serialize_force_inline void set_length( object_type &, int64_t ) noexcept {}
+        static serialize_force_inline void finalize_read( object_type & object, int64_t length ) noexcept { ( object.*Member )[length] = '\0'; }
+        static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( strlen( object.*Member ) ); }
+    };
+
+    /**
+        Serialize a runtime-length byte block: a count member in [0,extent], alignment to byte, then
+        that many bytes. Wire identical to serialize_int of the count followed by serialize_bytes.
+        Runtime-base strategy, exactly like string.
+     */
+    template <auto DataMember, auto CountMember> struct bytes_n
+    {
+        using object_type = typename schema_detail::member_traits<decltype(DataMember)>::object_type;
+        using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
+
+        static constexpr field_kind kind = field_kind::dynamic;
+        static constexpr int64_t max_length = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(DataMember)>::value_type> );
+        static_assert( max_length >= 1 );
+        static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
+
+        static consteval int64_t bits_at( int64_t K ) { return length_bits + schema_detail::align_pad( K + length_bits ) + max_length * 8; }
+
+        static serialize_force_inline uint8_t * dst( object_type & object ) noexcept { return object.*DataMember; }
+        static serialize_force_inline const uint8_t * src( const object_type & object ) noexcept { return object.*DataMember; }
+
+        static serialize_force_inline void set_length( object_type & object, int64_t length ) noexcept { object.*CountMember = count_type( length ); }
+        static serialize_force_inline void finalize_read( object_type &, int64_t ) noexcept {}
+        static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( object.*CountMember ); }
+    };
+
     namespace schema_detail
     {
-        template <typename X> struct field_list_of { using type = X; };            // a plain fields<...> list
+        template <typename X> struct field_list_of { using type = X; };            // primary: a plain fields<...> list
 
         // flatten: replace every object with its inner fields (accessors composed through nest),
         // and flatten the two sides of every branch. the result contains only leaf/bytes/branch fields.
@@ -1853,7 +2052,40 @@ namespace serialize
             using type = typename concat<expanded, flatten_t<fields<Rest...>>>::type;
         };
 
+        template <typename... Lists> struct concat_many { using type = fields<>; };
+        template <typename First, typename... Rest> struct concat_many<First, Rest...>
+        {
+            using type = typename concat<First, typename concat_many<Rest...>::type>::type;
+        };
+
+        template <auto M, typename InnerFlat, typename Seq> struct expand_array;
+        template <auto M, typename InnerFlat, size_t... Is> struct expand_array<M, InnerFlat, std::index_sequence<Is...>>
+        {
+            using type = typename concat_many<wrap_at_t<M, int64_t( Is ), InnerFlat>...>::type;
+        };
+
+        template <auto M, int Bits, typename Seq> struct expand_bits_array;
+        template <auto M, int Bits, size_t... Is> struct expand_bits_array<M, Bits, std::index_sequence<Is...>>
+        {
+            using type = fields<scalar_element<M, int64_t( Is ), Bits>...>;
+        };
+
+        template <auto M, typename Inner, int64_t Count, typename... Rest> struct flatten<fields<array<M, Inner, Count>, Rest...>>
+        {
+            using expanded = typename expand_array<M, flatten_t<typename field_list_of<Inner>::type>, std::make_index_sequence<size_t( Count )>>::type;
+            using type = typename concat<expanded, flatten_t<fields<Rest...>>>::type;
+        };
+
+        template <auto M, int Bits, int64_t Count, typename... Rest> struct flatten<fields<bits_array<M, Bits, Count>, Rest...>>
+        {
+            using expanded = typename expand_bits_array<M, Bits, std::make_index_sequence<size_t( Count )>>::type;
+            using type = typename concat<expanded, flatten_t<fields<Rest...>>>::type;
+        };
+
         template <typename T, int64_t SegBase, int64_t K, typename... Fs> struct runner;
+
+        // one specialized, fully constant path per possible count of an array_n field
+        template <typename T, int64_t SegBase, int64_t K, typename F, int64_t I, typename... Rest> struct counted_dispatch;
 
         // splice a fields<...> list in front of the remaining fields
         template <typename T, int64_t SegBase, int64_t K, typename List, typename... Rest> struct splice;
@@ -1888,6 +2120,10 @@ namespace serialize
             {
                 if constexpr ( F::kind == field_kind::branch )
                     return K + 1;
+                else if constexpr ( F::kind == field_kind::counted )
+                    return K + F::count_bits;
+                else if constexpr ( F::kind == field_kind::dynamic )
+                    return K + F::length_bits;
                 else
                     return runner<T, SegBase, next, Rest...>::prefix_end();
             }
@@ -1902,6 +2138,15 @@ namespace serialize
                     const int64_t a = then_runner::max_end();
                     const int64_t b = else_runner::max_end();
                     return a > b ? a : b;
+                }
+                else if constexpr ( F::kind == field_kind::counted )
+                {
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::max_end();
+                }
+                else if constexpr ( F::kind == field_kind::dynamic )
+                {
+                    // the rest of the schema restarts at a byte aligned runtime base after the content
+                    return K + F::bits_at( K ) + runner<T, 0, 0, Rest...>::max_end();
                 }
                 else
                 {
@@ -1929,6 +2174,39 @@ namespace serialize
                             return false;
                         return else_runner::read( data, bytes, object );
                     }
+                }
+                else if constexpr ( F::kind == field_kind::counted )
+                {
+                    const int64_t count = int64_t( get_const<K, F::count_bits>( data ) );
+                    if ( count > F::max_count )
+                        return false;
+                    F::set_count( object, count );
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::read( data, bytes, count, object );
+                }
+                else if constexpr ( F::kind == field_kind::dynamic )
+                {
+                    const int64_t length = int64_t( get_const<K, F::length_bits>( data ) );
+                    if ( length > F::max_length )
+                        return false;
+                    F::set_length( object, length );
+                    constexpr int pad = int( align_pad( K + F::length_bits ) );
+                    if constexpr ( pad > 0 )
+                    {
+                        if ( get_const<K + F::length_bits, pad>( data ) != 0 )
+                            return false;
+                    }
+                    constexpr int64_t contentByte = ( K + F::length_bits + pad ) >> 3;
+                    if ( contentByte + length > bytes )
+                        return false;
+                    small_copy( F::dst( object ), data + contentByte, size_t( length ) );
+                    F::finalize_read( object, length );
+                    // the rest of the schema continues at a runtime byte offset: a fresh compile time
+                    // run relative to the new base, so shifts and masks stay constants
+                    const int64_t base = contentByte + length;
+                    using rest = runner<T, 0, 0, Rest...>;
+                    if ( ( bytes - base ) * 8 < rest::prefix_end() )
+                        return false;
+                    return rest::read( data + base, bytes - base, object );
                 }
                 else if constexpr ( F::kind == field_kind::bytes )
                 {
@@ -1966,6 +2244,28 @@ namespace serialize
                         return else_runner::write( data, words, object );
                     }
                 }
+                else if constexpr ( F::kind == field_kind::counted )
+                {
+                    const int64_t count = F::get_count( object );
+                    serialize_assert( count >= 0 );
+                    serialize_assert( count <= F::max_count );
+                    put_const<SegBase, K, F::count_bits>( words, uint64_t( count ) );
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::write( data, words, count, object );
+                }
+                else if constexpr ( F::kind == field_kind::dynamic )
+                {
+                    const int64_t length = F::length_for_write( object );
+                    serialize_assert( length >= 0 );
+                    serialize_assert( length <= F::max_length );
+                    put_const<SegBase, K, F::length_bits>( words, uint64_t( length ) );
+                    constexpr int pad = int( align_pad( K + F::length_bits ) );
+                    constexpr int64_t contentByte = ( K + F::length_bits + pad ) >> 3;
+                    flush_words<SegBase, K + F::length_bits + pad>( data, words );
+                    small_copy( data + contentByte, F::src( object ), size_t( length ) );
+                    const int64_t base = contentByte + length;
+                    using rest = runner<T, 0, 0, Rest...>;
+                    return base + rest::write( data + base, words, object );
+                }
                 else if constexpr ( F::kind == field_kind::bytes )
                 {
                     // flush the words accumulated so far, copy the bytes directly, start a new segment after them
@@ -1981,6 +2281,51 @@ namespace serialize
                     F::template write<SegBase, K>( data, words, object );
                     return runner<T, SegBase, next, Rest...>::write( data, words, object );
                 }
+            }
+        };
+
+        // count == I selects a fully constant path containing I elements and the rest of the schema.
+        // linear forward compares: count was validated against max_count, so I == max_count matches last.
+        template <typename T, int64_t SegBase, int64_t K, typename F, int64_t I, typename... Rest> struct counted_dispatch
+        {
+            using path = typename splice<T, SegBase, K, typename F::template elements<I>, Rest...>::type;
+
+            static consteval int64_t max_end()
+            {
+                if constexpr ( I == F::max_count )
+                {
+                    return path::max_end();
+                }
+                else
+                {
+                    const int64_t a = path::max_end();
+                    const int64_t b = counted_dispatch<T, SegBase, K, F, I + 1, Rest...>::max_end();
+                    return a > b ? a : b;
+                }
+            }
+
+            static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t count, T & object ) noexcept
+            {
+                if ( count == I )
+                {
+                    if ( bytes * 8 < path::prefix_end() )
+                        return false;
+                    return path::read( data, bytes, object );
+                }
+                if constexpr ( I < F::max_count )
+                    return counted_dispatch<T, SegBase, K, F, I + 1, Rest...>::read( data, bytes, count, object );
+                else
+                    return false;               // unreachable: count was validated against max_count
+            }
+
+            static serialize_force_inline int64_t write( uint8_t * data, uint64_t * words, int64_t count, const T & object ) noexcept
+            {
+                if ( count == I )
+                    return path::write( data, words, object );
+                if constexpr ( I < F::max_count )
+                    return counted_dispatch<T, SegBase, K, F, I + 1, Rest...>::write( data, words, count, object );
+                else
+                    return 0;                   // unreachable: count was asserted against max_count
             }
         };
 
@@ -2022,7 +2367,7 @@ namespace serialize
             @returns True if every field decoded and validated, false otherwise (bad packets are rejected, exactly like the read stream).
          */
 
-        [[nodiscard]] static bool Read( const uint8_t * data, int64_t bytes, object_type & object ) noexcept
+        [[nodiscard]] static serialize_force_inline bool Read( const uint8_t * data, int64_t bytes, object_type & object ) noexcept
         {
             serialize_assert( data );
             if ( bytes * 8 < root::prefix_end() )
@@ -2039,7 +2384,7 @@ namespace serialize
             @returns The number of bytes written.
          */
 
-        static int64_t Write( uint8_t * data, int64_t bytes, const object_type & object ) noexcept
+        static serialize_force_inline int64_t Write( uint8_t * data, int64_t bytes, const object_type & object ) noexcept
         {
             serialize_assert( data );
             serialize_assert( bytes >= MaxBytes );
@@ -3857,6 +4202,209 @@ inline void test_schema_object()
     }
 }
 
+// array and bits_array are the compile time for loop: a schema with arrays must be byte-identical
+// to a serialize method that loops over the elements.
+
+struct SchemaArrayPacket
+{
+    SchemaVec points[3];
+    uint32_t counts[5];
+    int32_t after;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        for ( int i = 0; i < 3; i++ )
+            serialize_object( stream, points[i] );
+        for ( int i = 0; i < 5; i++ )
+            serialize_bits( stream, counts[i], 9 );
+        serialize_int( stream, after, -100, +100 );
+        return true;
+    }
+};
+
+using SchemaArrayPacketSchema = serialize::schema<
+    serialize::array<&SchemaArrayPacket::points, SchemaVecSchema>,          // count defaults to the extent (3)
+    serialize::bits_array<&SchemaArrayPacket::counts, 9>,                   // count defaults to the extent (5)
+    serialize::int_<&SchemaArrayPacket::after, -100, +100> >;
+
+static_assert( SchemaArrayPacketSchema::MaxBits == 3 * 96 + 5 * 9 + 8 );
+
+inline void test_schema_array()
+{
+    SchemaArrayPacket packet;
+    memset( (void*) &packet, 0, sizeof( packet ) );
+    for ( int i = 0; i < 3; i++ )
+    {
+        packet.points[i].x = float( i ) + 0.5f;
+        packet.points[i].y = float( i ) * -2.0f;
+        packet.points[i].z = float( i ) * 100.0f;
+    }
+    for ( int i = 0; i < 5; i++ )
+        packet.counts[i] = uint32_t( i * 97 ) & 511;
+    packet.after = -42;
+
+    uint8_t macro_buffer[64 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+    serialize::WriteStream writeStream( macro_buffer, 64 );
+    serialize_check( packet.Serialize( writeStream ) == true );
+    writeStream.Flush();
+    const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+    uint8_t schema_buffer[64 + 8] = { 0 };
+    const int64_t schemaBytes = SchemaArrayPacketSchema::Write( schema_buffer, 64, packet );
+    serialize_check( schemaBytes == macroBytes );
+    serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+    // schema reads the macro bytes
+    SchemaArrayPacket out;
+    memset( (void*) &out, 0, sizeof( out ) );
+    serialize_check( SchemaArrayPacketSchema::Read( macro_buffer, macroBytes, out ) == true );
+    for ( int i = 0; i < 3; i++ )
+    {
+        serialize_check( out.points[i].x == packet.points[i].x );
+        serialize_check( out.points[i].y == packet.points[i].y );
+        serialize_check( out.points[i].z == packet.points[i].z );
+    }
+    for ( int i = 0; i < 5; i++ )
+        serialize_check( out.counts[i] == packet.counts[i] );
+    serialize_check( out.after == packet.after );
+
+    // the macros read the schema bytes
+    SchemaArrayPacket out2;
+    memset( (void*) &out2, 0, sizeof( out2 ) );
+    serialize::ReadStream readStream( schema_buffer, schemaBytes );
+    serialize_check( out2.Serialize( readStream ) == true );
+    serialize_check( out2.after == packet.after );
+    serialize_check( out2.counts[4] == packet.counts[4] );
+    serialize_check( out2.points[2].z == packet.points[2].z );
+
+    // truncated packets must fail cleanly
+    SchemaArrayPacket truncated;
+    memset( (void*) &truncated, 0, sizeof( truncated ) );
+    serialize_check( SchemaArrayPacketSchema::Read( macro_buffer, 8, truncated ) == false );
+}
+
+// the dynamic primitives: string and bytes_n hand off to a runtime byte base, array_n specializes
+// one constant path per count. all three must be byte-identical to the equivalent serialize methods.
+
+struct SchemaDynPacket
+{
+    uint32_t head;
+    char name[21];
+    int32_t mid;
+    uint8_t data[13];
+    int32_t data_count;
+    SchemaVec rings[5];
+    int32_t ring_count;
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_bits( stream, head, 11 );
+        serialize_string( stream, name, (int) sizeof( name ) );
+        serialize_int( stream, mid, -1000, +1000 );
+        serialize_int( stream, data_count, 0, 13 );
+        serialize_bytes( stream, data, data_count );
+        serialize_int( stream, ring_count, 0, 5 );
+        for ( int i = 0; i < ring_count; i++ )
+            serialize_object( stream, rings[i] );
+        serialize_bits( stream, tail, 32 );
+        return true;
+    }
+};
+
+using SchemaDynSchema = serialize::schema<
+    serialize::bits<&SchemaDynPacket::head, 11>,
+    serialize::string<&SchemaDynPacket::name>,
+    serialize::int_<&SchemaDynPacket::mid, -1000, +1000>,
+    serialize::bytes_n<&SchemaDynPacket::data, &SchemaDynPacket::data_count>,
+    serialize::array_n<&SchemaDynPacket::rings, &SchemaDynPacket::ring_count, SchemaVecSchema>,
+    serialize::bits<&SchemaDynPacket::tail, 32> >;
+
+inline void test_schema_dynamic()
+{
+    const int counts[3][2] = { { 0, 0 }, { 13, 5 }, { 9, 3 } };         // data_count, ring_count: boundaries and a middle
+
+    for ( int variant = 0; variant < 3; variant++ )
+    {
+        SchemaDynPacket packet;
+        memset( (void*) &packet, 0, sizeof( packet ) );
+        packet.head = 1234 & 2047;
+        serialize_copy_string( packet.name, variant == 0 ? "" : "hello dyn", sizeof( packet.name ) );
+        packet.mid = -777;
+        packet.data_count = counts[variant][0];
+        for ( int i = 0; i < packet.data_count; i++ )
+            packet.data[i] = (uint8_t) ( i * 41 + 3 );
+        packet.ring_count = counts[variant][1];
+        for ( int i = 0; i < packet.ring_count; i++ )
+        {
+            packet.rings[i].x = float( i );
+            packet.rings[i].y = float( i ) - 0.5f;
+            packet.rings[i].z = float( i ) * 3.0f;
+        }
+        packet.tail = 0xC0FFEE42;
+
+        uint8_t macro_buffer[128 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+        serialize::WriteStream writeStream( macro_buffer, 128 );
+        serialize_check( packet.Serialize( writeStream ) == true );
+        writeStream.Flush();
+        const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+        uint8_t schema_buffer[128 + 8] = { 0 };
+        const int64_t schemaBytes = SchemaDynSchema::Write( schema_buffer, 128, packet );
+        serialize_check( schemaBytes == macroBytes );
+        serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+        // schema reads the macro bytes
+        SchemaDynPacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaDynSchema::Read( macro_buffer, macroBytes, out ) == true );
+        serialize_check( out.head == packet.head );
+        serialize_check( strcmp( out.name, packet.name ) == 0 );
+        serialize_check( out.mid == packet.mid );
+        serialize_check( out.data_count == packet.data_count );
+        serialize_check( memcmp( out.data, packet.data, (size_t) packet.data_count ) == 0 );
+        serialize_check( out.ring_count == packet.ring_count );
+        for ( int i = 0; i < packet.ring_count; i++ )
+        {
+            serialize_check( out.rings[i].x == packet.rings[i].x );
+            serialize_check( out.rings[i].y == packet.rings[i].y );
+            serialize_check( out.rings[i].z == packet.rings[i].z );
+        }
+        serialize_check( out.tail == packet.tail );
+
+        // the macros read the schema bytes
+        SchemaDynPacket out2;
+        memset( (void*) &out2, 0, sizeof( out2 ) );
+        serialize::ReadStream readStream( schema_buffer, schemaBytes );
+        serialize_check( out2.Serialize( readStream ) == true );
+        serialize_check( strcmp( out2.name, packet.name ) == 0 );
+        serialize_check( out2.tail == packet.tail );
+
+        // truncated packets must fail cleanly at every prefix length
+        for ( int64_t truncate = 0; truncate < macroBytes; truncate++ )
+        {
+            SchemaDynPacket t;
+            memset( (void*) &t, 0, sizeof( t ) );
+            serialize_check( SchemaDynSchema::Read( macro_buffer, truncate, t ) == false );
+        }
+    }
+
+    // a malicious packet can encode a string length above buffer_size - 1 in the bit headroom:
+    // lengths [0,20] take 5 bits, so 21..31 must be rejected
+    {
+        uint8_t buffer[128 + 8] = { 0 };
+        serialize::WriteStream writeStream( buffer, 128 );
+        uint32_t head = 0;
+        writeStream.SerializeBits( head, 11 );
+        uint32_t bad_length = 31;
+        writeStream.SerializeBits( bad_length, 5 );
+        writeStream.Flush();
+        SchemaDynPacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaDynSchema::Read( buffer, 128, out ) == false );
+    }
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -4110,6 +4658,8 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_bits64 );
         SERIALIZE_RUN_TEST( test_schema );
         SERIALIZE_RUN_TEST( test_schema_object );
+        SERIALIZE_RUN_TEST( test_schema_array );
+        SERIALIZE_RUN_TEST( test_schema_dynamic );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

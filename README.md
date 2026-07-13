@@ -144,13 +144,32 @@ bool ok = BodySchema::Read( buffer, bytesWritten, body );       // validates and
 Schemas compose (`object` splices inner schemas in place at compile time) and support
 conditional structure (`branch` serializes a bool then one of two field lists; every branch
 outcome gets its own fully constant layout, so each conditional roughly doubles the generated code
-for what follows it). Fields: `bits`, `int_`, `int64`, `bool_`,
-`float_`, `double_`, `align`, `bytes`, `branch`, `object`.
-Variable-length structure (runtime array counts, strings) stays on the streams.
+for what follows it).
+
+Loops and variable-length data are covered by three strategies:
+
+* `array` / `bits_array` — fixed-count arrays: the compile time for loop, fully unrolled, every
+  element at constant offsets.
+* `array_n` — a runtime count up to a small maximum (the items array extent, capped at 16): the
+  generated code contains one fully constant path per possible count, selected by forward compares,
+  so zero overhead survives a runtime count. Cost is code size: keep the maximum small and put
+  counted arrays near the end of the schema.
+* `string` / `bytes_n` — runtime-length sections: after the content, the rest of the schema
+  continues at a runtime byte offset as a fresh compile time run, so every shift and mask stays a
+  constant and only the base pointer is a register. The length-bounded copy is the only loop.
+
+Measured on a packet mixing a string, a runtime byte block and a runtime-count array of vectors
+(lengths and counts varying unpredictably): schema reads 240 M packets/s vs 61 M for the stream
+path — 3.9x. Unbounded collections stay on the streams.
+
+Full field vocabulary: `bits`, `int_`, `int64`, `bool_`, `float_`, `double_`, `align`, `bytes`,
+`branch`, `object`, `array`, `bits_array`, `array_n`, `string`, `bytes_n`.
 
 The zero-overhead property is enforced in CI: a codegen audit disassembles the generated schema
 Read/Write functions on every pull request and fails if calls, loops or instruction-count blowups
-appear.
+appear. Fixed-layout schemas are held to straight-line, call-free code; schemas with runtime-length
+sections are audited under a documented profile that allows the length-bounded copies but still
+enforces instruction budgets.
 
 # Differences from classic serialize
 

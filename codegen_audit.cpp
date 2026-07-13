@@ -93,6 +93,30 @@ using AuditBodySchema = serialize::schema<
 
 static_assert( AuditBodySchema::MaxBits == 96 + 1 + 96 );
 
+// a packet with runtime-length sections. these audit under the script's 'dynamic' profile: the
+// runtime-length copies are allowed to loop (and strlen to be called), but the functions must stay
+// within an instruction budget and may not use indirect branches — and everything around the
+// dynamic sections still folds to constants.
+struct AuditDyn
+{
+    uint32_t head;
+    char name[16];
+    int32_t mid;
+    uint8_t blob[8];
+    int32_t blob_count;
+    AuditVec rings[3];
+    int32_t ring_count;
+    uint32_t tail;
+};
+
+using AuditDynSchema = serialize::schema<
+    serialize::bits<&AuditDyn::head, 11>,
+    serialize::string<&AuditDyn::name>,
+    serialize::int_<&AuditDyn::mid, -100, +100>,
+    serialize::bytes_n<&AuditDyn::blob, &AuditDyn::blob_count>,
+    serialize::array_n<&AuditDyn::rings, &AuditDyn::ring_count, AuditVecSchema>,
+    serialize::bits<&AuditDyn::tail, 32> >;
+
 // the audited functions. extern "C" so the audit script finds them by unmangled name.
 
 extern "C" bool audit_fixed_read( const uint8_t * data, int64_t bytes, AuditPacket & packet )
@@ -113,4 +137,14 @@ extern "C" bool audit_body_read( const uint8_t * data, int64_t bytes, AuditBody 
 extern "C" int64_t audit_body_write( uint8_t * data, const AuditBody & body )
 {
     return AuditBodySchema::Write( data, AuditBodySchema::MaxBytes, body );
+}
+
+extern "C" bool audit_dynamic_read( const uint8_t * data, int64_t bytes, AuditDyn & packet )
+{
+    return AuditDynSchema::Read( data, bytes, packet );
+}
+
+extern "C" int64_t audit_dynamic_write( uint8_t * data, const AuditDyn & packet )
+{
+    return AuditDynSchema::Write( data, AuditDynSchema::MaxBytes, packet );
 }
