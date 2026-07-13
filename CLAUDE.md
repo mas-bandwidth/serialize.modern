@@ -2,6 +2,12 @@
 
 ## What this is
 
+**Status: pre-release and experimental.** The wire format is pinned, but the
+API — especially the schema language — is young and evolving, and the owner
+explicitly does not want it presented as mature or production ready (classic
+serialize is the production choice). User feedback on the schema language
+design is actively solicited via GitHub issues.
+
 **serialize.modern** is the modern C++ (C++23) port of classic
 [serialize](https://github.com/mas-bandwidth/serialize), a single-header C++
 bitpacking serializer (~2,300 lines of library code in
@@ -67,7 +73,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 26 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 27 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under

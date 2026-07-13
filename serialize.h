@@ -2348,28 +2348,37 @@ namespace serialize
     };
 
     /**
-        Serialize a runtime-count array: a count member in [0,Max], then that many elements. Max is
-        the items array extent. Wire identical to serialize_int of the count followed by the elements
-        in a loop.
+        Serialize a runtime-count array: a count member in [MinCount,MaxCount], then that many
+        elements. MaxCount defaults to the items array extent and MinCount to zero. Wire identical
+        to serialize_int of the count over [MinCount,MaxCount] followed by the elements in a loop —
+        so a nonzero MinCount both tightens the wire and enforces the protocol invariant that at
+        least MinCount elements are always present (reads cannot even express a smaller count).
 
         This is the bounded specialization strategy: the generated code contains one fully constant
         path per possible count, selected by forward compares — zero overhead is preserved for a
         runtime count. The cost is code size (each possible count instantiates its elements AND the
-        rest of the schema), so keep Max small (capped at 16) and put counted arrays near the end of
-        the schema. Large or unbounded collections belong on the streams.
+        rest of the schema), so the RANGE of counts is capped at 16 and counted arrays belong near
+        the end of the schema. Large ranges and unbounded collections stay on the streams.
      */
-    template <auto ItemsMember, auto CountMember, typename Inner> struct array_n
+    template <auto ItemsMember, auto CountMember, typename Inner,
+              int64_t MinCount = 0,
+              int64_t MaxCount = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type> )>
+    struct array_n
     {
         using object_type = typename schema_detail::member_traits<decltype(ItemsMember)>::object_type;
         using count_type = typename schema_detail::member_traits<decltype(CountMember)>::value_type;
 
-        static constexpr int64_t max_count = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type> );
-        static_assert( max_count >= 1 );
-        static_assert( max_count <= 16, "array_n generates one specialized path per possible count: keep the maximum count small (use the streams for large collections)" );
+        static constexpr int64_t extent = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(ItemsMember)>::value_type> );
+        static constexpr int64_t min_count = MinCount;
+        static constexpr int64_t max_count = MaxCount;
+        static_assert( min_count >= 0 );
+        static_assert( min_count < max_count );
+        static_assert( max_count <= extent );
+        static_assert( max_count - min_count <= 16, "array_n generates one specialized path per possible count: keep the count RANGE small (use the streams for large collections)" );
 
         static constexpr field_kind kind = field_kind::counted;
         using writes = schema_detail::path_list<schema_detail::member_path<CountMember>>;
-        static constexpr int count_bits = bits_required( 0, uint32_t( max_count ) );
+        static constexpr int count_bits = bits_required( 0, uint32_t( max_count - min_count ) );
 
         static consteval int64_t bits_at( int64_t ) { return count_bits; }
 
@@ -2665,7 +2674,7 @@ namespace serialize
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
-                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::max_end();
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, F::min_count, Rest...>::max_end();
                 }
                 else if constexpr ( F::kind == field_kind::dynamic )
                 {
@@ -2706,7 +2715,7 @@ namespace serialize
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
-                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::measure( F::get_count( object ), object );
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, F::min_count, Rest...>::measure( F::get_count( object ), object );
                 }
                 else if constexpr ( F::kind == field_kind::dynamic )
                 {
@@ -2775,11 +2784,13 @@ namespace serialize
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
-                    const int64_t count = int64_t( get_const<K, F::count_bits>( data ) );
-                    if ( count > F::max_count )
+                    // the count is wire encoded relative to min_count, like serialize_int( count, min, max )
+                    const int64_t raw = int64_t( get_const<K, F::count_bits>( data ) );
+                    if ( raw > F::max_count - F::min_count )
                         return false;
+                    const int64_t count = F::min_count + raw;
                     F::set_count( object, count );
-                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::read( data, bytes, count, object );
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, F::min_count, Rest...>::read( data, bytes, count, object );
                 }
                 else if constexpr ( F::kind == field_kind::relative )
                 {
@@ -2866,10 +2877,10 @@ namespace serialize
                 else if constexpr ( F::kind == field_kind::counted )
                 {
                     const int64_t count = F::get_count( object );
-                    serialize_assert( count >= 0 );
+                    serialize_assert( count >= F::min_count );
                     serialize_assert( count <= F::max_count );
-                    put_const<SegBase, K, F::count_bits>( words, uint64_t( count ) );
-                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::write( data, words, count, object );
+                    put_const<SegBase, K, F::count_bits>( words, uint64_t( count - F::min_count ) );
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, F::min_count, Rest...>::write( data, words, count, object );
                 }
                 else if constexpr ( F::kind == field_kind::relative )
                 {
@@ -5771,6 +5782,85 @@ inline void test_schema_nested_dynamic()
     }
 }
 
+// array_n with explicit min/max count bounds: the count is wire encoded relative to the minimum,
+// exactly like serialize_int( count, min, max ), so a count below the minimum cannot even be
+// expressed on the wire, and the count range (not the array extent) bounds the specialized paths.
+
+struct SchemaBoundedPacket
+{
+    SchemaVec waypoints[8];
+    int32_t waypoint_count;         // always in [2,5]
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_int( stream, waypoint_count, 2, 5 );
+        for ( int i = 0; i < waypoint_count; i++ )
+            serialize_object( stream, waypoints[i] );
+        serialize_bits( stream, tail, 16 );
+        return true;
+    }
+};
+
+using SchemaBoundedSchema = serialize::schema<
+    serialize::array_n<&SchemaBoundedPacket::waypoints, &SchemaBoundedPacket::waypoint_count, SchemaVecSchema, 2, 5>,
+    serialize::bits<&SchemaBoundedPacket::tail, 16> >;
+
+// counts [2,5] span 4 values: 2 bits on the wire, and the longest path is 5 elements
+static_assert( SchemaBoundedSchema::MaxBits == 2 + 5 * 96 + 16 );
+
+inline void test_schema_array_n_bounds()
+{
+    for ( int count = 2; count <= 5; count++ )
+    {
+        SchemaBoundedPacket packet;
+        memset( (void*) &packet, 0, sizeof( packet ) );
+        packet.waypoint_count = count;
+        for ( int i = 0; i < count; i++ )
+        {
+            packet.waypoints[i].x = float( i * 10 );
+            packet.waypoints[i].y = float( i ) - 2.5f;
+            packet.waypoints[i].z = 1.0f;
+        }
+        packet.tail = 0xF00D;
+
+        uint8_t macro_buffer[80 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+        serialize::WriteStream writeStream( macro_buffer, 80 );
+        serialize_check( packet.Serialize( writeStream ) == true );
+        writeStream.Flush();
+        const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+        serialize_check( SchemaBoundedSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
+
+        uint8_t schema_buffer[80 + 8] = { 0 };
+        const int64_t schemaBytes = SchemaBoundedSchema::Write( schema_buffer, 80, packet );
+        serialize_check( schemaBytes == macroBytes );
+        serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+        SchemaBoundedPacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaBoundedSchema::Read( macro_buffer, macroBytes, out ) == true );
+        serialize_check( out.waypoint_count == packet.waypoint_count );
+        for ( int i = 0; i < count; i++ )
+            serialize_check( out.waypoints[i].x == packet.waypoints[i].x );
+        serialize_check( out.tail == packet.tail );
+
+        SchemaBoundedPacket out2;
+        memset( (void*) &out2, 0, sizeof( out2 ) );
+        serialize::ReadStream readStream( schema_buffer, schemaBytes );
+        serialize_check( out2.Serialize( readStream ) == true );
+        serialize_check( out2.waypoint_count == packet.waypoint_count );
+
+        // truncated packets must fail cleanly at every prefix length
+        for ( int64_t truncate = 0; truncate < macroBytes; truncate++ )
+        {
+            SchemaBoundedPacket t;
+            memset( (void*) &t, 0, sizeof( t ) );
+            serialize_check( SchemaBoundedSchema::Read( macro_buffer, truncate, t ) == false );
+        }
+    }
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -6030,6 +6120,7 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_extras );
         SERIALIZE_RUN_TEST( test_schema_relative );
         SERIALIZE_RUN_TEST( test_schema_nested_dynamic );
+        SERIALIZE_RUN_TEST( test_schema_array_n_bounds );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

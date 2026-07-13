@@ -4,6 +4,18 @@
 
 **serialize.modern** is the modern C++ port of [serialize](https://github.com/mas-bandwidth/serialize), a simple bitpacking serializer for C++.
 
+> **Status: pre-release.** serialize.modern is new and experimental. The wire format is pinned and
+> gated against classic serialize in CI, but the library itself — especially the compile time
+> schema language — is young, still evolving, and has not shipped in production anywhere. It is
+> **not** mature and production ready the way the other ports are: if you need battle tested today,
+> use [classic serialize](https://github.com/mas-bandwidth/serialize), which is wire compatible
+> with this library.
+>
+> **Feedback is very much appreciated — especially on the schema language design**: the field
+> vocabulary, the branch/match/back-reference model, the array and string strategies, and anything
+> you find missing or awkward. Please open an issue at
+> [github.com/mas-bandwidth/serialize.modern/issues](https://github.com/mas-bandwidth/serialize.modern/issues).
+
 It requires C++23 and produces **byte-identical wire output to classic serialize**: data written by either library reads back correctly with the other. This is enforced in CI on every pull request — a harness is built against both libraries, the two streams must match byte-for-byte, and each library must decode the stream the other wrote.
 
 It has the following features:
@@ -150,10 +162,12 @@ Loops and variable-length data are covered by three strategies:
 
 * `array` / `bits_array` — fixed-count arrays: the compile time for loop, fully unrolled, every
   element at constant offsets.
-* `array_n` — a runtime count up to a small maximum (the items array extent, capped at 16): the
-  generated code contains one fully constant path per possible count, selected by forward compares,
-  so zero overhead survives a runtime count. Cost is code size: keep the maximum small and put
-  counted arrays near the end of the schema.
+* `array_n` — a runtime count in `[MinCount, MaxCount]` (defaults: zero to the items array
+  extent): the generated code contains one fully constant path per possible count, selected by
+  forward compares, so zero overhead survives a runtime count. The count is wire encoded relative
+  to the minimum, exactly like `serialize_int( count, min, max )` — a nonzero minimum tightens the
+  wire and makes counts below it inexpressible. Cost is code size: the count RANGE is capped at 16
+  (the array extent may be larger); put counted arrays near the end of the schema.
 * `string` / `bytes_n` — runtime-length sections: after the content, the rest of the schema
   continues at a runtime byte offset as a fresh compile time run, so every shift and mask stays a
   constant and only the base pointer is a register. The length-bounded copy is the only loop.
