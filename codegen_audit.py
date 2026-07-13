@@ -48,7 +48,14 @@ AUDITS = {
 
 CALL_MNEMONICS = { "bl", "blr", "call", "callq" }
 INDIRECT_BRANCH_MNEMONICS = { "br", "blr", "jmpq" }
-BRANCH_PREFIXES = ( "b", "j", "cbz", "cbnz", "tbz", "tbnz", "loop" )
+
+
+def is_branch( mnemonic, base ):
+    # arm64: b and b.<cond> (base is the part before the dot), cbz/cbnz/tbz/tbnz.
+    # x86: j<cc>/jmp and loop. deliberately NOT a bare startswith("b"): x86 ALU instructions
+    # like bts/bsf/bswap begin with b and are not branches (a bts once false-positived this gate).
+    return base == "b" or mnemonic in ( "cbz", "cbnz", "tbz", "tbnz" ) \
+        or mnemonic.startswith( "j" ) or mnemonic.startswith( "loop" )
 
 
 def run( args ):
@@ -134,7 +141,7 @@ def audit_function( name, body, profile="fixed" ):
                 violations.append( f"call instruction at {address:#x}: {mnemonic} {operands}" )
         elif base in INDIRECT_BRANCH_MNEMONICS:
             violations.append( f"indirect branch at {address:#x}: {mnemonic} {operands}" )
-        elif mnemonic.startswith( BRANCH_PREFIXES ):
+        elif is_branch( mnemonic, base ):
             target = branch_target( operands )
             if target is None:
                 violations.append( f"indirect branch at {address:#x}: {mnemonic} {operands}" )
