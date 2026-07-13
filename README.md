@@ -161,7 +161,8 @@ serialize_object. `Schema::MeasureBits( object )` returns the exact serialized s
 Reads validate everything and reject malformed packets, exactly like the read stream.
 
 **The full reference is [SCHEMA.md](SCHEMA.md)** — field vocabulary, wire formats, the code size
-model, and what should stay on the streams.
+model, and what should stay on the streams. For how upcoming C++ features (C++26 reflection,
+contracts, expansion statements) are expected to shape the library, see [FUTURE.md](FUTURE.md).
 
 The zero-overhead property is enforced in CI on GCC, clang and MSVC: a codegen audit disassembles
 the generated schema functions on every pull request and fails on call instructions, loops,
