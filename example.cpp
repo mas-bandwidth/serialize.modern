@@ -541,9 +541,11 @@ int main()
             break;
         }
 
-        uint8_t buffer[100*1024];
+        const int BufferSize = 100*1024;
 
-        serialize::WriteStream writeStream( buffer, sizeof(buffer) );
+        uint8_t buffer[BufferSize + 8];         // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+
+        serialize::WriteStream writeStream( buffer, BufferSize );
         if ( !input.Serialize( writeStream ) )
         {
             printf( "error: serialize write failed\n" );

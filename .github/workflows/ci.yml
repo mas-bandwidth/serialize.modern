@@ -39,6 +39,39 @@ jobs:
             ./build/bin/bench
           fi
 
+  # wire format compatibility gate. serialize.modern promises byte-identical wire output to
+  # classic serialize: this job builds the wire_compat harness against BOTH libraries (classic
+  # pinned at a released tag), then requires the two corpus streams to be byte-identical and each
+  # library to decode the stream the other wrote. any wire format divergence fails the PR.
+  wire-compat:
+    name: wire compat vs classic / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        include:
+          - os: windows-2025
+            cmake_args: -A x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout classic serialize (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: mas-bandwidth/serialize
+          ref: v1.4.3
+          path: classic
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSERIALIZE_WIRE_COMPAT_CLASSIC_DIR="${{ github.workspace }}/classic" ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target wire_compat_modern wire_compat_classic
+
+      - name: Wire compatibility matrix
+        run: ctest --test-dir build --build-config Release -R wire_compat --output-on-failure
+
   # the only big endian coverage in the matrix: exercises the bswap / host_to_network
   # path for real, and the golden wire format test proves the wire bytes are identical
   big-endian:

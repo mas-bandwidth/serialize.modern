@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(serialize VERSION 1.4.3 LANGUAGES CXX)
+project(serialize VERSION 1.0.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
@@ -18,6 +18,8 @@ option(SERIALIZE_FUZZ "Build the libFuzzer harness (requires clang)" OFF)
 # header-only library: consumers get the include path and nothing else — no compile flags leak
 add_library(serialize INTERFACE)
 add_library(serialize::serialize ALIAS serialize)
+# serialize.modern requires C++23: <bit>, std::bit_cast, std::byteswap, std::endian, if constexpr macros
+target_compile_features(serialize INTERFACE cxx_std_23)
 target_include_directories(serialize INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -72,6 +74,7 @@ if(SERIALIZE_BUILD_TESTS)
 
     foreach(target serialize_test example bench)
         target_link_libraries(${target} PRIVATE serialize)
+        target_compile_features(${target} PRIVATE cxx_std_23)
         target_compile_options(${target} PRIVATE ${SERIALIZE_DEV_FLAGS})
         target_compile_definitions(${target} PRIVATE
             $<$<CONFIG:Debug>:SERIALIZE_DEBUG>
@@ -83,10 +86,52 @@ if(SERIALIZE_BUILD_TESTS)
     add_test(NAME test COMMAND serialize_test)
 endif()
 
+# cross-library wire compatibility gate. point SERIALIZE_WIRE_COMPAT_CLASSIC_DIR at a checkout of
+# classic serialize (https://github.com/mas-bandwidth/serialize) to build the wire_compat harness
+# against BOTH libraries and register tests that prove the wire formats are identical: the two
+# binaries must produce byte-identical corpus streams, and each must read the other's stream.
+# the two headers share a header guard, namespace and macros, so the harness includes <serialize.h>
+# with angle brackets and each executable selects its library purely via the include path.
+# CI runs this on every push and pull request; see .github/workflows/ci.yml.
+set(SERIALIZE_WIRE_COMPAT_CLASSIC_DIR "" CACHE PATH "Path to a classic serialize checkout; enables the cross-library wire compatibility tests")
+
+if(SERIALIZE_BUILD_TESTS AND SERIALIZE_WIRE_COMPAT_CLASSIC_DIR)
+    if(NOT EXISTS ${SERIALIZE_WIRE_COMPAT_CLASSIC_DIR}/serialize.h)
+        message(FATAL_ERROR "SERIALIZE_WIRE_COMPAT_CLASSIC_DIR does not contain serialize.h: ${SERIALIZE_WIRE_COMPAT_CLASSIC_DIR}")
+    endif()
+
+    add_executable(wire_compat_modern wire_compat.cpp serialize.h)
+    target_include_directories(wire_compat_modern PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+    add_executable(wire_compat_classic wire_compat.cpp ${SERIALIZE_WIRE_COMPAT_CLASSIC_DIR}/serialize.h)
+    target_include_directories(wire_compat_classic PRIVATE ${SERIALIZE_WIRE_COMPAT_CLASSIC_DIR})
+
+    foreach(target wire_compat_modern wire_compat_classic)
+        target_compile_features(${target} PRIVATE cxx_std_23)
+        target_compile_options(${target} PRIVATE ${SERIALIZE_DEV_FLAGS})
+        target_compile_definitions(${target} PRIVATE
+            $<$<CONFIG:Debug>:SERIALIZE_DEBUG>
+            $<$<NOT:$<CONFIG:Debug>>:SERIALIZE_RELEASE>
+        )
+    endforeach()
+
+    add_test(NAME wire_compat_write_classic COMMAND wire_compat_classic write ${CMAKE_CURRENT_BINARY_DIR}/wire_classic.bin)
+    add_test(NAME wire_compat_write_modern COMMAND wire_compat_modern write ${CMAKE_CURRENT_BINARY_DIR}/wire_modern.bin)
+
+    # the corpus streams must be byte-identical, and each library must decode the other's stream
+    add_test(NAME wire_compat_bytes_identical COMMAND ${CMAKE_COMMAND} -E compare_files ${CMAKE_CURRENT_BINARY_DIR}/wire_classic.bin ${CMAKE_CURRENT_BINARY_DIR}/wire_modern.bin)
+    add_test(NAME wire_compat_modern_reads_classic COMMAND wire_compat_modern read ${CMAKE_CURRENT_BINARY_DIR}/wire_classic.bin)
+    add_test(NAME wire_compat_classic_reads_modern COMMAND wire_compat_classic read ${CMAKE_CURRENT_BINARY_DIR}/wire_modern.bin)
+
+    set_tests_properties(wire_compat_write_classic wire_compat_write_modern PROPERTIES FIXTURES_SETUP wire_corpus)
+    set_tests_properties(wire_compat_bytes_identical wire_compat_modern_reads_classic wire_compat_classic_reads_modern PROPERTIES FIXTURES_REQUIRED wire_corpus)
+endif()
+
 # libFuzzer harness for the read side. requires clang. build in Debug so asserts stay live.
 if(SERIALIZE_FUZZ)
     add_executable(fuzz fuzz.cpp serialize.h)
     target_link_libraries(fuzz PRIVATE serialize)
+    target_compile_features(fuzz PRIVATE cxx_std_23)
     target_compile_options(fuzz PRIVATE ${SERIALIZE_DEV_FLAGS} -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
     target_link_options(fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
     target_compile_definitions(fuzz PRIVATE

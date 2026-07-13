@@ -134,6 +134,80 @@ void bench_bitpacker( uint8_t * buffer )
 
 // ------------------------------------------------------------------------------------------
 
+// The fixed width pattern above repeats every 16 ops, which a branch predictor learns perfectly.
+// Real packet traffic is not that friendly, so this benchmark drives the bitpacker with a
+// precomputed random width sequence: any per-write branch (like a scratch flush) becomes a
+// mispredict tax here, while a branchless bitpacker should hold its throughput.
+
+const int RandomMaxOps = 65536;
+
+static int random_num_ops = 0;
+static int random_widths[RandomMaxOps];
+static uint32_t random_values[RandomMaxOps];
+
+void bench_bitpacker_random( uint8_t * buffer )
+{
+    // fill the op list with as many random width writes as fit in the buffer (fixed seed: identical sequence every run)
+    uint64_t rng = 0x2545F4914F6CDD1DULL;
+    int64_t total_bits = 0;
+    random_num_ops = 0;
+    while ( random_num_ops < RandomMaxOps )
+    {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        const int width = 1 + (int) ( ( rng >> 33 ) % 32 );                             // [1,32]
+        if ( total_bits + width > int64_t( BitpackerBufferSize ) * 8 )
+            break;
+        const uint32_t mask = ( width == 32 ) ? 0xFFFFFFFF : ( ( 1u << width ) - 1 );
+        random_widths[random_num_ops] = width;
+        random_values[random_num_ops] = uint32_t( rng >> 8 ) & mask;
+        total_bits += width;
+        random_num_ops++;
+    }
+
+    double best_write = 1e30;
+    double best_read = 1e30;
+
+    uint64_t bytes_per_pass = 0;
+
+    for ( int trial = 0; trial < NumTrials; trial++ )
+    {
+        double start = time_now();
+        for ( int pass = 0; pass < BitpackerNumPasses; pass++ )
+        {
+            serialize::BitWriter writer( buffer, BitpackerBufferSize );
+            for ( int i = 0; i < random_num_ops; i++ )
+                writer.WriteBits( random_values[i], random_widths[i] );
+            writer.FlushBits();
+            bench_escape( buffer );
+            bytes_per_pass = (uint64_t) writer.GetBytesWritten();
+            g_sink = g_sink + bytes_per_pass;
+        }
+        double time = time_now() - start;
+        if ( time < best_write )
+            best_write = time;
+
+        start = time_now();
+        for ( int pass = 0; pass < BitpackerNumPasses; pass++ )
+        {
+            serialize::BitReader reader( buffer, BitpackerBufferSize );
+            uint64_t sum = 0;
+            for ( int i = 0; i < random_num_ops; i++ )
+                sum += reader.ReadBits( random_widths[i] );
+            g_sink = g_sink + sum;
+        }
+        time = time_now() - start;
+        if ( time < best_read )
+            best_read = time;
+    }
+
+    const double total_mb = double( bytes_per_pass ) * BitpackerNumPasses / ( 1024.0 * 1024.0 );
+
+    printf( "bitpacker write (random widths): %8.1f MB/s\n", total_mb / best_write );
+    printf( "bitpacker read (random widths):  %8.1f MB/s\n", total_mb / best_read );
+}
+
+// ------------------------------------------------------------------------------------------
+
 struct BenchPacket
 {
     int32_t a, b, c;
@@ -204,21 +278,27 @@ inline uint64_t bench_vary_packet( BenchPacket & packet, uint64_t rng )
 
 void bench_stream()
 {
-    uint8_t buffer[256];
-    memset( buffer, 0, sizeof( buffer ) );
+    const int PacketBufferSize = 256;
+
+    // packet buffers live on the heap: with stack buffers the stream numbers swing by up to ~25%
+    // from incidental stack frame layout (store-to-load aliasing between the stream object and the
+    // packet rows), which measures luck rather than the serializer.
+    uint8_t * buffer = (uint8_t*) malloc( PacketBufferSize + 8 );           // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+    memset( buffer, 0, PacketBufferSize + 8 );
 
     BenchPacket packet;
     packet.Init();
 
-    uint8_t variant_buffers[NumVariants][256];
+    uint8_t * variant_buffers[NumVariants];
     int bytes_per_packet = 0;
     {
         uint64_t rng = 1;
         for ( int k = 0; k < NumVariants; k++ )
         {
-            memset( variant_buffers[k], 0, sizeof( variant_buffers[k] ) );
+            variant_buffers[k] = (uint8_t*) malloc( PacketBufferSize + 8 );
+            memset( variant_buffers[k], 0, PacketBufferSize + 8 );
             rng = bench_vary_packet( packet, rng );
-            serialize::WriteStream stream( variant_buffers[k], (int) sizeof( variant_buffers[k] ) );
+            serialize::WriteStream stream( variant_buffers[k], PacketBufferSize );
             if ( !packet.Serialize( stream ) )
                 exit( 1 );
             stream.Flush();
@@ -238,7 +318,7 @@ void bench_stream()
         for ( int i = 0; i < StreamNumPackets; i++ )
         {
             rng = bench_vary_packet( packet, rng );
-            serialize::WriteStream stream( buffer, (int) sizeof( buffer ) );
+            serialize::WriteStream stream( buffer, PacketBufferSize );
             if ( !packet.Serialize( stream ) )
                 exit( 1 );
             stream.Flush();
@@ -285,6 +365,10 @@ void bench_stream()
     printf( "stream write:     %8.1f MB/s  (%.1f M packets/s)\n", total_mb / best_write, packets / best_write );
     printf( "stream read:      %8.1f MB/s  (%.1f M packets/s)\n", total_mb / best_read, packets / best_read );
     printf( "stream measure:   %19.1f M packets/s\n", packets / best_measure );
+
+    for ( int k = 0; k < NumVariants; k++ )
+        free( variant_buffers[k] );
+    free( buffer );
 }
 
 // ------------------------------------------------------------------------------------------
@@ -297,9 +381,11 @@ int main()
     printf( "WARNING: this is a debug build. only release build numbers are meaningful!\n\n" );
 #endif
 
-    uint8_t * buffer = (uint8_t*) malloc( BitpackerBufferSize + 8 );        // + 8: read allocations extend 8 bytes past the data
+    uint8_t * buffer = (uint8_t*) malloc( BitpackerBufferSize + 8 );        // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
 
     bench_bitpacker( buffer );
+
+    bench_bitpacker_random( buffer );
 
     bench_stream();
 

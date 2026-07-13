@@ -1,10 +1,10 @@
 # Introduction
 
-[![CI](https://github.com/mas-bandwidth/serialize/actions/workflows/ci.yml/badge.svg)](https://github.com/mas-bandwidth/serialize/actions/workflows/ci.yml)
+[![CI](https://github.com/mas-bandwidth/serialize.modern/actions/workflows/ci.yml/badge.svg)](https://github.com/mas-bandwidth/serialize.modern/actions/workflows/ci.yml)
 
-**serialize** is a simple bitpacking serializer for C++.
+**serialize.modern** is the modern C++ port of [serialize](https://github.com/mas-bandwidth/serialize), a simple bitpacking serializer for C++.
 
-![image](https://github.com/mas-bandwidth/serialize/assets/696656/dc36cc53-3382-4a63-888e-6dbb53dda92d)
+It requires C++23 and produces **byte-identical wire output to classic serialize**: data written by either library reads back correctly with the other. This is enforced in CI on every pull request — a harness is built against both libraries, the two streams must match byte-for-byte, and each library must decode the stream the other wrote.
 
 It has the following features:
 
@@ -15,14 +15,18 @@ It has the following features:
 * Alignment support so you can align your bitstream to a byte boundary whenever you want
 * Optional template-based serialization so you can write one function that handles both read and write
 
+# Requirements
+
+A C++23 compiler: recent clang, GCC 12+, or MSVC 2022 (`-std=c++23` / `/std:c++latest`). If you need to support older toolchains, use [classic serialize](https://github.com/mas-bandwidth/serialize) — the wire formats are identical, so the two can interoperate across a network.
+
 # Usage
 
-You can use the bitpacker directly:
+The API is the same as classic serialize. You can use the bitpacker directly:
 
 ```c++
 const int BufferSize = 256;
 
-uint8_t buffer[BufferSize];
+uint8_t buffer[BufferSize + 8];         // + 8: buffer allocations extend 8 bytes past the end (see below)
 
 serialize::BitWriter writer( buffer, BufferSize );
 
@@ -108,10 +112,34 @@ struct RigidBody
 
 See [example.cpp](example.cpp) for more.
 
+# Differences from classic serialize
+
+The wire format is identical. What changed:
+
+* **One buffer rule instead of two.** For both writing and reading, the buffer allocation must extend at least 8 bytes past the end of the data. In exchange, write buffer *sizes* no longer need to be a multiple of 8 — any size works. (Classic requires multiple-of-8 write sizes and the +8 allocation only for reads.)
+* **Up to 56 bits move in a single operation.** New `WriteBits64`/`ReadBits64` on the bitpacker and `SerializeBits64` on the streams handle [1,64] bits per call, with widths up to 56 taking a single store or window load. `serialize_int64` with a range that fits 56 bits costs one operation instead of two. The bit stream is LSB-first, so the bytes are identical to the classic 32+32 split.
+* **C++23 internals.** `std::bit_width`, `std::bit_cast`, `std::byteswap` and `std::endian` replace the platform macros, compiler builtins and memcpy punning; the serialize macros use `if constexpr`; the bit math is constexpr and usable in `static_assert`.
+* **The hot core is explicitly force-inlined**, which measures significantly faster on the stream read and write paths.
+* `FlushBits` is still required after writing, exactly as in classic serialize.
+
+# Performance
+
+Measured on Apple Silicon (Apple clang, Release, medians of interleaved runs) against classic serialize 1.4.3:
+
+| benchmark | classic | serialize.modern |
+|---|---|---|
+| bitpacker write | 5,905 MB/s | 5,962 MB/s |
+| bitpacker read | 8,184 MB/s | 8,138 MB/s |
+| bitpacker write (random widths) | 3,774 MB/s | 3,733 MB/s |
+| bitpacker read (random widths) | 3,652 MB/s | 3,648 MB/s |
+| stream write | 44.3 M packets/s | ~64 M packets/s |
+| stream read | ~135 M packets/s | ~120 M packets/s |
+
+The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations).
+
 # Limitations
 
-* Write buffer sizes must be a multiple of 8 bytes, because the bit writer flushes qwords to memory. Bytes past the end of the written data are only ever written as zeros. Buffers do not need any particular alignment: all memory access goes through memcpy.
-* Read buffer sizes may be any number of bytes, but the underlying allocation must extend at least 8 bytes past the end of the packet data, because the bit reader loads 64 bit windows at byte granularity. The bytes past the end are loaded but never interpreted.
+* Buffer allocations must extend at least 8 bytes past the end of the data, for both writing and reading: the writer flushes whole qwords and the reader loads 64 bit windows at byte granularity. Bytes past the end of written data are only ever written as zeros; bytes past the end of read data are loaded but never interpreted. Buffers do not need any particular alignment: all memory access goes through memcpy.
 * Buffer sizes are effectively unlimited, because bit counts are stored in 64 bit signed integers.
 * Wide strings are serialized as 32 bits per character, so streams are compatible between platforms with 2 and 4 byte wchar_t, but code points above 0xFFFF are not translated between UTF-16 and UTF-32 platforms.
 

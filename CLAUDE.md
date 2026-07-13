@@ -2,171 +2,148 @@
 
 ## What this is
 
-A single-header C++ bitpacking serializer (~2,100 lines of library code in
-[serialize.h](serialize.h), plus ~700 lines of embedded tests) aimed at game
-networking. Header-only is intentional: the serialize methods are heavily
-templated, so the implementation cannot live in a .cpp file. The header is
-self-contained — including it into a translation unit with no prior
-includes must compile — and includes only the libc headers the library
-uses (stdint, stddef, string, wchar, math, plus conditional assert/endian;
-test-only includes live behind `SERIALIZE_ENABLE_TESTS`). It descends from the yojimbo/netcode lineage: a word-at-a-time
-`BitWriter`/`BitReader` core, and `WriteStream`/`ReadStream`/`MeasureStream`
-wrappers driven through templated `Serialize()` methods so one function handles
-read, write, and measure with compile-time branch elimination.
+**serialize.modern** is the modern C++ (C++23) port of classic
+[serialize](https://github.com/mas-bandwidth/serialize), a single-header C++
+bitpacking serializer (~2,300 lines of library code in
+[serialize.h](serialize.h), plus ~1,100 lines of embedded tests) aimed at game
+networking. The wire protocol is **byte-identical to classic serialize** —
+this is the repo's core invariant and is enforced two ways: the golden wire
+format test pins the exact bytes (same golden bytes as classic), and the
+`wire-compat` CI job builds [wire_compat.cpp](wire_compat.cpp) against both
+libraries (classic pinned at v1.4.3), requires the two corpus streams to be
+byte-identical, and cross-reads each stream with the other library. Never
+change the wire format; if the golden test or the wire gate fails, the change
+is wrong.
+
+Header-only is intentional (heavily templated serialize methods), and the
+header is self-contained: including it into a translation unit with no prior
+includes must compile. Requires C++23 (`<bit>`, `std::bit_cast`,
+`std::byteswap`, `std::endian`, `if constexpr` macros). The API is classic's
+(same classes, same serialize_* / read_* / write_* macros), plus
+`WriteBits64`/`ReadBits64`/`SerializeBits64` for [1,64] bit values.
 
 Build: `cmake -B build && cmake --build build --config Release`, test with
 `ctest --test-dir build --build-config Release`. Tests live in serialize.h
-behind `SERIALIZE_ENABLE_TESTS`. CI (.github/workflows/ci.yml) builds and
-tests Debug + Release on Linux (ubuntu-24.04), macOS Apple Silicon
-(macos-15), and Windows x64 (windows-2025), plus ASan+UBSan and libFuzzer
-jobs on Linux and a big-endian s390x job (GCC cross-compile, statically
-linked, run under QEMU user emulation). The fuzz harness ([fuzz.cpp](fuzz.cpp), clang only, built via
-`-DSERIALIZE_FUZZ=ON`) runs two passes per input: a hostile read of
-arbitrary bytes through every ReadStream primitive, and a differential
-write→read round trip that traps on any write/read asymmetry (and checks
-MeasureStream never under-measures). A golden wire-format test
-(`test_golden_wire_format` in serialize.h) pins the exact bytes the
-serializer produces; if it fails, the wire format changed — a breaking
-change for previously written data.
+behind `SERIALIZE_ENABLE_TESTS`. CI (.github/workflows/ci.yml): Debug +
+Release on Linux/macOS/Windows, the wire-compat gate on all three platforms,
+ASan+UBSan and libFuzzer jobs on Linux, and a big-endian s390x job under
+QEMU. To run the wire gate locally:
+`cmake -B build -DSERIALIZE_WIRE_COMPAT_CLASSIC_DIR=<classic checkout> . && ctest --test-dir build -R wire_compat`.
+
+## Differences from classic (owner-approved, July 2026)
+
+- **Allocation contract**: one rule for both sides — buffer allocations must
+  extend at least 8 bytes past the end of the data (writer flushes whole
+  qwords; reader loads 64 bit windows at byte granularity). In exchange, the
+  classic multiple-of-8 write buffer size rule is gone: any size works.
+- **FlushBits is still required** after writing, exactly as classic. (A
+  branchless writer that made flush a no-op was built and rejected on
+  measurement; see the performance record.)
+- Single puts/loads move up to 56 bits (`MaxWriteBits`/`MaxReadBits`), so
+  `serialize_int64` ranges that fit 56 bits cost one operation instead of
+  two. Wire-identical: the stream is LSB-first, so any split produces the
+  same bytes. 56 (not 57) because a spilling put must keep its carry shift
+  below 64 — 57 was an undefined-behavior bug caught during development.
+- Version 1.0.0 (`SERIALIZE_VERSION`), matching CMake: the first release of this
+  library. serialize.modern does not continue classic's 1.4.x numbering — the two
+  version lines are independent (wire_compat output prints both, e.g. classic 1.4.3
+  vs modern 1.0.0).
 
 ## Honest assessment
 
 ### Verified state (July 2026)
 
-- All tests pass in Debug and Release on Linux x64, macOS Apple Silicon,
-  Windows x64, and big-endian s390x (GCC cross-compile under QEMU), on
-  every push.
-- The golden wire-format test proves all four platforms — including big
-  endian — produce and decode byte-identical wire data.
-- All tests pass under ASan + UBSan including the alignment sanitizer.
-- Fuzzing (hostile read + differential write→read round trip): 60 seconds
-  per push, 1 hour nightly with a cumulative corpus. No findings to date.
-- Compiles clean with `-Wall -Wextra -Wpedantic`. `-Wconversion -Wshadow`
-  produces ~80 warnings — implicit narrowing is a deliberate style here
-  (the header disables MSVC C4244 for the same reason).
-- Header and CMake version is 1.4.3 (`SERIALIZE_VERSION`), matching the
-  v1.4.3 tag and GitHub release (latest, July 2026; v1.4.1 was skipped).
-  1.4.3 tightens the write buffer contract to multiple-of-8 sizes (docs
-  and debug assert; no behavior change for conforming buffers). 1.4.2
-  carries the qword-flush writer (~25% faster writes), the
-  symmetric write-side allocation contract, and the README limitations
-  fixes. 1.4.0 carries the branchless
-  reader and its breaking allocation contract change (read buffers must
-  extend 8 bytes past the data, previously round-up-to-4), plus 64-bit bit
-  counts throughout, which removes the old 256 MB buffer limit
-  (test_large_buffer round trips across the old 2^31-bit boundary); the
-  wire format is unchanged.
-- Throughput ([bench.cpp](bench.cpp), Release, Apple Silicon reference):
-  bitpacker write ~5.8 GB/s, read ~8.1 GB/s; stream write ~47M packets/s,
-  read ~140M packets/s. (Reads got ~4x faster in 1.4.0 with the branchless
-  reader; writes ~25% faster in 1.4.2 with the 64-bit flush.)
+- All 18 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+  Silicon (Apple clang 21). **CI has not yet run** — the port has not been
+  pushed, so GCC, MSVC and big-endian builds of the C++23 code are
+  unverified. Treat the first CI run as part of the port.
+- The wire-compat gate passes locally against classic v1.4.3: byte-identical
+  65 KB corpus (every primitive, widths straddling every internal split
+  point) and both cross-reads. A negative test (one flipped bit) fails both
+  readers, so the gate can actually fail.
+- The golden wire format test passes with classic's exact golden bytes.
+- The fuzz harness compiles but cannot run locally (Apple clang ships no
+  libFuzzer); it relies on the CI fuzz job and nightly-fuzz workflow.
 
-### What's genuinely good
+### Performance engineering record
 
-- **The read path is defensive, and recently hardened.** Every `ReadStream`
-  operation bounds-checks before reading and range-checks after
-  ([serialize.h:1056](serialize.h:1056)), returning false instead of asserting,
-  so malicious packets fail cleanly. Arithmetic that could overflow signed
-  ints is done in the unsigned domain with comments explaining why (e.g.
-  [serialize.h:908](serialize.h:908), [serialize.h:1726](serialize.h:1726)),
-  and NaN is clamped before any float-to-int cast
-  ([serialize.h:1454](serialize.h:1454)). Recent commits show active work here.
-- **The tests cover adversarial cases, not just round trips**: out-of-range
-  encodings smuggled into bit headroom, full `[INT32_MIN, INT32_MAX]` ranges,
-  negative and huge byte counts, NaN input, >2^31 relative gaps
-  ([serialize.h:2610](serialize.h:2610) onward). This is better test thinking
-  than most serialization libraries have.
-- **The core design is sound and well understood.** Writer: 64-bit scratch,
-  64-bit flush — the scratch stores as a qword when it fills and the bits
-  that spilled past 64 carry into the next scratch, so the flush branch runs
-  half as often as a dword design (~+25% write throughput, measured); each
-  word is stored via `memcpy` so the buffer needs no particular alignment.
-  Reader: branchless —
-  each read loads a 64-bit window at the current byte position and shifts by
-  the bit remainder, carrying no state between reads except the bit index.
-  This made reads ~4x faster than the previous word-at-a-time reader
-  (measured; see throughput above) at the cost of the 8-bytes-past
-  allocation contract below. Little-endian wire format with byte-swap on
-  big-endian hosts; identical wire bytes to the old reader/writer, pinned by
-  the golden test. `test_unaligned_writer` locks the no-alignment guarantee
-  in.
-- Documentation density is high, and the doc comments mostly tell you the
-  sharp edges (flush requirement, 256 MB limit, alignment contracts).
+Every design decision below was measured on Apple Silicon (interleaved
+best-of-5 runs, heap-buffered benchmark). Kept:
 
-### Sharp edges and weaknesses
+- **Classic 64 bit scratch, qword flush writer.** A fully branchless
+  store-per-write writer was built first and lost everywhere: 3,400 vs 6,000
+  MB/s on the fixed-pattern benchmark, 12% behind on random widths — its
+  serial OR+shift scratch chain costs more than the well-predicted flush
+  branch. The flush writer was restored, generalized to 56 bit puts.
+- **`serialize_force_inline` on the bitpack hot core** (PutBits/GetBits,
+  WriteBits*/ReadBits*, stream SerializeInteger*/SerializeBits*): the 64 bit
+  paths exceed inline budgets, and an out-of-line call mid-decode spills
+  state — worth ~20% stream read and ~16% stream write.
+- **`small_copy`**: inline overlapping-chunk copies for byte blocks ≤ 64
+  bytes (`SmallCopyMaxBytes`), bypassing the libc memcpy call: +20% stream
+  write. The threshold is tuned only against 17-byte benchmark blobs.
 
-Nothing currently open. Items formerly listed here were either fixed or
-confirmed as intentional design:
+Rejected, with measurements — do not re-propose without new evidence:
 
-- Fixed: the MSVC `#pragma warning(disable: 4127, 4244)` is now push/pop'd
-  so warning state no longer leaks into consumers (code using the
-  serialize macros compiles at the including file's warning state;
-  consumers who share the implicit-narrowing style disable those warnings
-  themselves, as this repo's own executables do). `BitWriter` uses member
-  initializers rather than `memset(this, ...)`. Using a stream before
-  `Initialize()` fires an explicit debug assert. The header includes only
-  the libc headers the library actually uses, and consumers can no longer
-  accidentally depend on it providing stdio/stdlib.
-- Intentional design (recorded under "Known limits" below): unchecked
-  writes in release, the read allocation contract, the macro control
-  flow.
+- `[[likely]]`/`[[unlikely]]` on stream validation branches: **cost** 10% of
+  stream read throughput.
+- `[[assume]]`/`__builtin_assume` bit-range hints: zero effect, UB risk.
+- 128 bit (`__int128`) scratch writer, flushing every 128 bits: exact parity
+  — wider ALU ops cancel the halved flush rate (and MSVC has no `__int128`).
+  The 32→64 scratch widening was worth +25% historically; 64→128 is worth 0.
+  The scratch sweet spot is the native register width.
+- Force-inlining the serialize_bytes/align path: parity.
+- Grouped-field decode (fusing adjacent small fields into one
+  `SerializeBits64`, cutting window loads from ~12 to ~7 per packet): +3%,
+  within noise. L1 window loads are nearly free; not worth contorting
+  serialize code.
+- PGO (Apple clang, instrumented profile of the benchmark itself): −15%
+  stream write. Measure before trusting PGO on this kind of code.
 
-### Known limits (documented, by design)
+Benchmark epistemology, learned the hard way:
 
-- **The trust model**: debug asserts verify correctness, and in release
-  correctness is the caller's responsibility — there is no runtime bounds
-  checking on the write path (size buffers conservatively or pre-measure
-  with `MeasureStream`). The one exception is network input: the read path
-  validates at runtime in release and drops invalid data, because asserts
-  are not enough at the trust boundary. Do not propose hardened/checked
-  write modes.
-- **The serialize macros hide `return false` on purpose.** When reading a
-  packet, invalid data must abort the entire serialize function
-  immediately — never carrying on deeper into the serialization or into a
-  loop bounded by malicious data. The library is low-level C-style and
-  chooses not to use exceptions, so early-return macros are the pragmatic
-  mechanism. Serialize functions must be `template <typename Stream>`
-  returning bool (documented). Do not propose redesigns (exceptions, error
-  codes). The ~30 macros land in the global macro namespace; not a
-  collision risk for yojimbo, which depends on serialize.h directly.
-- **The buffer contracts** (owner-approved, July 2026): write buffer
-  sizes must be a multiple of 8 bytes — the writer flushes qwords, and
-  bytes past the written data are only ever written as zeros. Read buffer
-  allocations must extend at least 8 bytes past the end of the packet
-  data — the reader loads 64-bit windows at byte granularity, and bytes
-  past the end are loaded but never interpreted. This is what makes the
-  qword-flush writer and the branchless reader possible. Documented on
-  the constructors. Do not propose removing these contracts or adding
-  tail handling to avoid them.
+- The classic fixed-width bitpacker benchmark flatters whichever design the
+  compiler can constant-fold: classic write drops from 6,006 to 3,935 MB/s
+  with a random width sequence. bench.cpp now carries both patterns.
+- Stream numbers at ~85 cycles/packet resolve **code/data placement luck**:
+  with instruction-identical decode functions, stream read swung between 107
+  and 144 M packets/s across 8-byte layout perturbations (member padding,
+  stack offsets, function alignment). The packet buffers were moved to the
+  heap in bench.cpp to reduce this; residual modern-vs-classic stream read
+  deltas are placement artifacts, not code quality (the decode disassembly
+  is identical and was verified instruction by instruction).
+
+### Known limits (documented, by design — inherited from classic)
+
+- **The trust model**: debug asserts verify correctness; in release the
+  write path is unchecked (pre-measure with MeasureStream or size
+  conservatively). The read path validates at runtime in release and drops
+  invalid data, because network input is the trust boundary. Do not propose
+  hardened/checked write modes.
+- **The serialize macros hide `return false` on purpose** — invalid packet
+  data must abort the whole serialize function immediately. Serialize
+  functions are `template <typename Stream>` returning bool. Do not propose
+  exceptions or error-code redesigns.
 - `serialize_int_relative` requires strictly increasing values.
-- `wstring` wire format is 32 bits per character — portable across 2/4-byte
-  `wchar_t` platforms, but wasteful.
+- `wstring` wire format is 32 bits per character.
 - `MeasureStream` is conservative: every align counts as 7 bits.
 
 ### Bottom line
 
-Small, mature, and does one thing well. The reader-side safety work and the
-adversarial tests are the standout strengths. The contracts (unchecked
-writes in release, the 8-bytes-past read allocation contract, early-return serialize
-macros) are intentional design — debug asserts plus caller responsibility
-on the trusted side, immediate validated abort on the network side — and
-the place for a new user to read the docs carefully; everything cheap to
-fix around them (CI, sanitizers, fuzzing, doc drift) has been done. Fuzz coverage: a 60-second smoke on every
-push, plus a nightly 1-hour run (.github/workflows/nightly-fuzz.yml) whose
-corpus accumulates across runs via the actions cache and which uploads crash
-reproducers as artifacts on failure.
+A faithful modern port that is measurably faster where it matters (stream
+writes ~45% over classic; bitpacker and reads at parity with identical
+decode instruction streams) and simpler to use (one allocation rule, any
+buffer size, readable concept errors, constexpr bit math). The wire format
+is pinned by a golden test and a cross-library CI gate against real classic
+binaries. The performance record above is the repo's institutional memory:
+most "obvious" modern optimizations were measured and rejected — check it
+before proposing perf changes.
 
 ### Open items
 
-- ~~The v1.3.0 tag is not pushed~~ — released July 2026: tag v1.3.0,
-  GitHub release "Stable Release" marked latest, covering everything
-  since v1.2.5 (CMake switch, CI/sanitizers/fuzzing/golden wire test,
-  writer alignment guarantee, `serialize_int64`, header hygiene).
-- ~~GCC stream benchmark numbers are inflated~~ — fixed, in two parts:
-  a `bench_escape` barrier (empty asm + memory clobber) stops dead-store
-  elimination of the output buffer, and an LCG varies most packet fields
-  per iteration so GCC can no longer constant-fold the loop-invariant
-  fields' scratch words at compile time. GCC still reports notably higher
-  stream numbers than MSVC (~92M vs ~33M packets/s) — that residual gap is
-  legitimate codegen (static field offsets merge adjacent writes), not
-  elimination.
+- First CI run pending (GCC/MSVC/s390x compilation of the C++23 header
+  unverified; the wire gate and sanitizer/fuzz jobs have only run locally
+  where possible).
+- `SmallCopyMaxBytes` (64) is tuned against a single workload.
+- Performance numbers are from one machine (Apple M-series); x86 numbers
+  should be read off the CI benchmark step once it runs.

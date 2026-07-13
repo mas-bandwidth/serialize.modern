@@ -527,9 +527,10 @@ extern "C" int LLVMFuzzerTestOneInput( const uint8_t * data, size_t size )
 
     // pass 2: differential round trip of values generated from the same bytes
     {
-        // worst case is ~260 bytes per op (a 241 byte serialize_bytes plus alignment), so 32 ops fit comfortably
+        // worst case is ~260 bytes per op (a 241 byte serialize_bytes plus alignment), so 32 ops fit comfortably.
+        // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
         const int WriteBufferSize = 16 * 1024;
-        alignas( 4 ) uint8_t writeBuffer[WriteBufferSize];
+        alignas( 4 ) uint8_t writeBuffer[WriteBufferSize + 8];
         memset( writeBuffer, 0, sizeof( writeBuffer ) );
 
         serialize::WriteStream writeStream( writeBuffer, WriteBufferSize );
