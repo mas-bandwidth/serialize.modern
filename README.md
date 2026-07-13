@@ -171,9 +171,22 @@ entirely at compile time. Forward references are compile errors: the schema stat
 that every referenced member is serialized unconditionally earlier (members inside one branch side
 or behind an array count don't count), on every compiler.
 
+Protocol plumbing: `const_<Value, Bits>` writes a compile time constant and read rejects any
+other value (magic numbers, versions, mid-stream sanity markers — corrupt packets fail at the
+first constant); `reserved_<Bits>` writes zeros and read requires zeros, for protocol evolution;
+`enum_<Member, MaxValue>` serializes enums with range validation; `compressed_float_` quantizes
+with every constant folded at compile time; `wstring_` covers wide strings (its wire adds an
+alignment before the 32 bit code points, unlike serialize_wstring); `int_relative_<Prev, Curr>`
+is the classic bucket encoding, wire identical to serialize_int_relative (it forks the layout
+tree seven ways — keep it near the end of a schema).
+
+`Schema::MeasureBits( object )` / `MeasureBytes( object )` return the exact serialized size for an
+object — unlike `MeasureStream`, alignment padding is computed from real compile time offsets, so
+the answer is exact, not conservative.
+
 Full field vocabulary: `bits`, `int_`, `int64`, `bool_`, `float_`, `double_`, `align`, `bytes`,
-`branch`, `branch_on`, `match`/`case_`, `object`, `array`, `bits_array`, `array_n`, `string`,
-`bytes_n`.
+`const_`, `reserved_`, `enum_`, `compressed_float_`, `branch`, `branch_on`, `match`/`case_`,
+`object`, `array`, `bits_array`, `array_n`, `string`, `bytes_n`, `wstring_`, `int_relative_`.
 
 The zero-overhead property is enforced in CI: a codegen audit disassembles the generated schema
 Read/Write functions on every pull request and fails if calls, loops or instruction-count blowups

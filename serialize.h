@@ -1431,7 +1431,7 @@ namespace serialize
     /// How the schema runner treats a field: an inline bitpacked value, an aligned byte block, a
     /// conditional branch, a bounded count with one specialized path per value, or a runtime-length
     /// section after which the schema continues at a runtime byte offset.
-    enum class field_kind { leaf, bytes, branch, branch_on, match, counted, dynamic };
+    enum class field_kind { leaf, bytes, branch, branch_on, match, counted, dynamic, relative };
 
     namespace schema_detail
     {
@@ -1729,6 +1729,163 @@ namespace serialize
         }
     };
 
+    /**
+        A protocol constant: writes Value in Bits, and read REJECTS any other value. Use for magic
+        numbers, protocol versions and mid-stream sanity markers — a corrupt or desynchronized
+        packet fails at the first constant instead of decoding garbage. Costs one compare against
+        an immediate. Wire identical to serialize_bits of the constant.
+     */
+    template <uint64_t Value, int Bits> struct const_
+    {
+        static_assert( Bits >= 1 && Bits <= 64 );
+        static_assert( Bits == 64 || Value <= ( ( uint64_t(1) << Bits ) - 1 ) );
+
+        static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<>;
+
+        static consteval int64_t bits_at( int64_t ) { return Bits; }
+
+        template <int64_t K, typename T> static serialize_force_inline bool read( const uint8_t * data, T & ) noexcept
+        {
+            return schema_detail::get_const<K, Bits>( data ) == Value;
+        }
+
+        template <int64_t SegBase, int64_t K, typename T> static serialize_force_inline void write( uint8_t *, uint64_t * words, const T & ) noexcept
+        {
+            schema_detail::put_const<SegBase, K, Bits>( words, Value );
+        }
+    };
+
+    /**
+        Reserved bits for protocol evolution: writes zeros, and read REJECTS nonzero (consistent
+        with alignment padding). A later protocol version can claim the bits behind a version gate.
+        Wire identical to serialize_bits of zero.
+     */
+    template <int Bits> struct reserved_
+    {
+        static_assert( Bits >= 1 && Bits <= 64 );
+
+        static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<>;
+
+        static consteval int64_t bits_at( int64_t ) { return Bits; }
+
+        template <int64_t K, typename T> static serialize_force_inline bool read( const uint8_t * data, T & ) noexcept
+        {
+            return schema_detail::get_const<K, Bits>( data ) == 0;
+        }
+
+        template <int64_t SegBase, int64_t K, typename T> static serialize_force_inline void write( uint8_t *, uint64_t *, const T & ) noexcept
+        {
+            // nothing to do: the staging words are already zero
+        }
+    };
+
+    /**
+        Serialize an enum member (enum class or plain) with values in [0,MaxValue], using the minimal
+        number of bits. Read rejects values above MaxValue, so the member always holds a legal
+        enumerator range value. Wire identical to serialize_int with range [0,MaxValue].
+     */
+    template <auto Member, auto MaxValue> struct enum_
+    {
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+        using value_type = typename schema_detail::member_traits<decltype(Member)>::value_type;
+
+        static constexpr uint32_t max_value = uint32_t( MaxValue );
+        static_assert( max_value >= 1 );
+
+        static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
+
+        static constexpr int Bits = bits_required( 0, max_value );
+
+        static consteval int64_t bits_at( int64_t ) { return Bits; }
+
+        template <int64_t K> static serialize_force_inline bool read( const uint8_t * data, object_type & object ) noexcept
+        {
+            const uint32_t raw = uint32_t( schema_detail::get_const<K, Bits>( data ) );
+            if ( raw > max_value )
+                return false;
+            object.*Member = value_type( raw );
+            return true;
+        }
+
+        template <int64_t SegBase, int64_t K> static serialize_force_inline void write( uint8_t *, uint64_t * words, const object_type & object ) noexcept
+        {
+            serialize_assert( uint32_t( object.*Member ) <= max_value );
+            schema_detail::put_const<SegBase, K, Bits>( words, uint32_t( object.*Member ) );
+        }
+    };
+
+    /**
+        Serialize a compressed float member: quantized to Res sized steps in [Min,Max]. All the
+        quantization constants (step count, bit width) fold at compile time — the stream version
+        computes them at runtime. Wire identical to serialize_compressed_float with the same
+        min/max/res. Reads reject quantized values above the step count.
+     */
+    template <auto Member, float Min, float Max, float Res> struct compressed_float_
+    {
+        static_assert( Min < Max );
+        static_assert( Res > 0.0f );
+
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static constexpr field_kind kind = field_kind::leaf;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
+
+    private:
+
+        // mirrors serialize_compressed_float_internal exactly, evaluated at compile time
+        static consteval float clamped_values()
+        {
+            const float values = ( Max - Min ) / Res;
+            if ( !( values >= 1.0f ) )
+                return 1.0f;
+            if ( values > 4294967040.0f )       // largest float below 2^32
+                return 4294967040.0f;
+            return values;
+        }
+
+        static consteval uint32_t consteval_ceil( float x )
+        {
+            const uint32_t truncated = uint32_t( x );       // x >= 1 by the clamp above
+            return ( float( truncated ) == x ) ? truncated : truncated + 1;
+        }
+
+    public:
+
+        static constexpr float delta = Max - Min;
+        static constexpr uint32_t max_integer_value = consteval_ceil( clamped_values() );
+        static constexpr int Bits = bits_required( 0, max_integer_value );
+
+        static consteval int64_t bits_at( int64_t ) { return Bits; }
+
+        template <int64_t K> static serialize_force_inline bool read( const uint8_t * data, object_type & object ) noexcept
+        {
+            const uint32_t integerValue = uint32_t( schema_detail::get_const<K, Bits>( data ) );
+            if ( integerValue > max_integer_value )
+                return false;
+            const float normalizedValue = integerValue / float( max_integer_value );
+            object.*Member = normalizedValue * delta + Min;
+            return true;
+        }
+
+        template <int64_t SegBase, int64_t K> static serialize_force_inline void write( uint8_t *, uint64_t * words, const object_type & object ) noexcept
+        {
+            // clamp with the !>= / !<= form so a NaN value is forced into range instead of reaching the uint32 cast below
+            float normalizedValue = ( object.*Member - Min ) / delta;
+            if ( !( normalizedValue >= 0.0f ) )
+            {
+                normalizedValue = 0.0f;
+            }
+            else if ( !( normalizedValue <= 1.0f ) )
+            {
+                normalizedValue = 1.0f;
+            }
+            schema_detail::put_const<SegBase, K, Bits>( words, uint32_t( std::floor( normalizedValue * max_integer_value + 0.5f ) ) );
+        }
+    };
+
     /// Pad with zero bits to the next byte boundary. Wire identical to serialize_align. Reads reject nonzero padding.
     struct align
     {
@@ -1850,6 +2007,59 @@ namespace serialize
         static serialize_force_inline int64_t get( const object_type & object ) noexcept { return int64_t( object.*Member ); }
     };
 
+    /**
+        Serialize an integer member relative to a PREVIOUSLY serialized member, using the classic
+        serialize bucket encoding: a difference of 1 costs one bit, then 2/4/8/12/16 bit buckets,
+        then a 32 bit absolute fallback. Values must be strictly increasing (current > previous),
+        exactly like serialize_int_relative, and reads reject violations. Wire identical to
+        serialize_int_relative. The previous member is a back reference: it must be serialized
+        unconditionally earlier in the schema (statically checked).
+        NOTE: each int_relative_ forks the layout tree seven ways (one path per bucket), like a
+        branch tree: keep them near the end of the schema.
+     */
+    template <auto PrevMember, auto CurrMember> struct int_relative_
+    {
+        using object_type = typename schema_detail::member_traits<decltype(CurrMember)>::object_type;
+        using value_type = typename schema_detail::member_traits<decltype(CurrMember)>::value_type;
+
+        static constexpr field_kind kind = field_kind::relative;
+        using writes = schema_detail::path_list<schema_detail::member_path<CurrMember>>;
+        using referenced = schema_detail::member_path<PrevMember>;
+
+        static constexpr int num_legs = 7;
+
+        static consteval int64_t leg_header_bits( int leg ) { return ( leg <= 5 ) ? leg + 1 : 6; }
+        static consteval uint64_t leg_header_value( int leg ) { return ( leg <= 5 ) ? ( uint64_t(1) << leg ) : 0; }
+
+        static consteval int leg_payload_bits( int leg )
+        {
+            constexpr int bits[7] = { 0, 3, 5, 9, 13, 17, 32 };
+            return bits[leg];
+        }
+
+        static consteval uint32_t leg_min( int leg )
+        {
+            constexpr uint32_t low[7] = { 1, 2, 7, 24, 281, 4378, 0 };
+            return low[leg];
+        }
+
+        static consteval uint32_t leg_max( int leg )
+        {
+            constexpr uint32_t high[7] = { 1, 6, 23, 280, 4377, 69914, 0xFFFFFFFF };
+            return high[leg];
+        }
+
+        static consteval int64_t leg_total_bits( int leg ) { return leg_header_bits( leg ) + leg_payload_bits( leg ); }
+
+        static consteval int64_t bits_at( int64_t ) { return leg_total_bits( 6 ); }         // the widest leg
+
+        static serialize_force_inline uint32_t get_prev( const object_type & object ) noexcept { return uint32_t( object.*PrevMember ); }
+        static serialize_force_inline uint32_t get_curr( const object_type & object ) noexcept { return uint32_t( object.*CurrMember ); }
+        static serialize_force_inline void set_curr( object_type & object, uint32_t value ) noexcept { object.*CurrMember = value_type( value ); }
+        static serialize_force_inline bool curr_greater_prev( const object_type & object ) noexcept { return object.*CurrMember > object.*PrevMember; }
+        static serialize_force_inline bool curr_valid_for_write( const object_type & object ) noexcept { return object.*PrevMember < object.*CurrMember; }
+    };
+
     namespace schema_detail
     {
         // nest<Outer, F>: the field F of an inner object, re-targeted at the outer object through
@@ -1932,6 +2142,42 @@ namespace serialize
             static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( object.*Outer ); }
         };
 
+        template <auto Outer, typename F> struct nest<Outer, F, field_kind::dynamic>
+        {
+            using object_type = typename member_traits<decltype(Outer)>::object_type;
+
+            static constexpr field_kind kind = field_kind::dynamic;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
+            static constexpr int64_t max_length = F::max_length;
+            static constexpr int length_bits = F::length_bits;
+            static constexpr int64_t unit_bytes = F::unit_bytes;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            static serialize_force_inline void set_length( object_type & object, int64_t length ) noexcept { F::set_length( object.*Outer, length ); }
+            static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return F::length_for_write( object.*Outer ); }
+            static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept { return F::read_content( object.*Outer, content, length ); }
+            static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept { F::write_content( object.*Outer, content, length ); }
+        };
+
+        template <auto Outer, typename F> struct nest<Outer, F, field_kind::counted>
+        {
+            using object_type = typename member_traits<decltype(Outer)>::object_type;
+
+            static constexpr field_kind kind = field_kind::counted;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
+            static constexpr int64_t max_count = F::max_count;
+            static constexpr int count_bits = F::count_bits;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            template <int64_t I> using elements = wrap_t<Outer, typename F::template elements<I>>;
+
+            static serialize_force_inline int64_t get_count( const object_type & object ) noexcept { return F::get_count( object.*Outer ); }
+            static serialize_force_inline void set_count( object_type & object, int64_t count ) noexcept { F::set_count( object.*Outer, count ); }
+        };
+
+
         template <int64_t V, typename List> struct case_from_list;
 
         template <auto Outer, typename CasePack> struct wrap_cases;
@@ -2009,6 +2255,25 @@ namespace serialize
 
             static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( ( object.*Member )[Index] ); }
             static serialize_force_inline void set( object_type & object, bool value ) noexcept { F::set( ( object.*Member )[Index], value ); }
+        };
+
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::dynamic>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+
+            static constexpr field_kind kind = field_kind::dynamic;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
+            static constexpr int64_t max_length = F::max_length;
+            static constexpr int length_bits = F::length_bits;
+            static constexpr int64_t unit_bytes = F::unit_bytes;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            static serialize_force_inline void set_length( object_type & object, int64_t length ) noexcept { F::set_length( ( object.*Member )[Index], length ); }
+            static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return F::length_for_write( ( object.*Member )[Index] ); }
+            static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept { return F::read_content( ( object.*Member )[Index], content, length ); }
+            static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept { F::write_content( ( object.*Member )[Index], content, length ); }
         };
 
         // one element of an unsigned integral array, Bits wide: the leaf bits_array expands into
@@ -2135,14 +2400,78 @@ namespace serialize
         static constexpr int64_t max_length = buffer_size - 1;
         static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
 
+        static constexpr int64_t unit_bytes = 1;
+
         static consteval int64_t bits_at( int64_t K ) { return length_bits + schema_detail::align_pad( K + length_bits ) + max_length * 8; }
 
-        static serialize_force_inline uint8_t * dst( object_type & object ) noexcept { return (uint8_t*) ( object.*Member ); }
-        static serialize_force_inline const uint8_t * src( const object_type & object ) noexcept { return (const uint8_t*) ( object.*Member ); }
+        static serialize_force_inline void set_length( object_type &, int64_t ) noexcept {}
+        static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( strlen( object.*Member ) ); }
+
+        static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept
+        {
+            small_copy( (uint8_t*) ( object.*Member ), content, size_t( length ) );
+            ( object.*Member )[length] = '\0';
+            return true;
+        }
+
+        static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept
+        {
+            small_copy( content, (const uint8_t*) ( object.*Member ), size_t( length ) );
+        }
+    };
+
+    /**
+        Serialize a wide string member (a wchar_t array): a length in [0,extent-1], alignment to
+        byte, then the code points as 32 bit little endian values. Compatible between platforms with
+        2 and 4 byte wchar_t; on 2 byte platforms, reads reject code points above 0xFFFF.
+        NOTE: the wire differs from serialize_wstring by the alignment before the code points (the
+        schema needs a byte aligned handoff). The stream equivalent is serialize_int of the length,
+        serialize_align, then serialize_bits of 32 per character.
+     */
+    template <auto Member> struct wstring_
+    {
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+
+        static constexpr int64_t buffer_size = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(Member)>::value_type> );
+        static_assert( buffer_size >= 2 );
+
+        static constexpr field_kind kind = field_kind::dynamic;
+        using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
+        static constexpr int64_t max_length = buffer_size - 1;
+        static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
+        static constexpr int64_t unit_bytes = 4;
+
+        static consteval int64_t bits_at( int64_t K ) { return length_bits + schema_detail::align_pad( K + length_bits ) + max_length * 32; }
 
         static serialize_force_inline void set_length( object_type &, int64_t ) noexcept {}
-        static serialize_force_inline void finalize_read( object_type & object, int64_t length ) noexcept { ( object.*Member )[length] = '\0'; }
-        static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( strlen( object.*Member ) ); }
+        static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( wcslen( object.*Member ) ); }
+
+        static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept
+        {
+            for ( int64_t i = 0; i < length; i++ )
+            {
+                uint32_t code_point;
+                memcpy( &code_point, content + i * 4, 4 );
+                code_point = network_to_host( code_point );
+                if constexpr ( sizeof( wchar_t ) == 2 )
+                {
+                    if ( code_point > 0xFFFF )
+                        return false;
+                }
+                ( object.*Member )[i] = wchar_t( code_point );
+            }
+            ( object.*Member )[length] = L'\0';
+            return true;
+        }
+
+        static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept
+        {
+            for ( int64_t i = 0; i < length; i++ )
+            {
+                const uint32_t code_point = host_to_network( uint32_t( ( object.*Member )[i] ) );
+                memcpy( content + i * 4, &code_point, 4 );
+            }
+        }
     };
 
     /**
@@ -2161,14 +2490,23 @@ namespace serialize
         static_assert( max_length >= 1 );
         static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
 
+        static constexpr int64_t unit_bytes = 1;
+
         static consteval int64_t bits_at( int64_t K ) { return length_bits + schema_detail::align_pad( K + length_bits ) + max_length * 8; }
 
-        static serialize_force_inline uint8_t * dst( object_type & object ) noexcept { return object.*DataMember; }
-        static serialize_force_inline const uint8_t * src( const object_type & object ) noexcept { return object.*DataMember; }
-
         static serialize_force_inline void set_length( object_type & object, int64_t length ) noexcept { object.*CountMember = count_type( length ); }
-        static serialize_force_inline void finalize_read( object_type &, int64_t ) noexcept {}
         static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return int64_t( object.*CountMember ); }
+
+        static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept
+        {
+            small_copy( object.*DataMember, content, size_t( length ) );
+            return true;
+        }
+
+        static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept
+        {
+            small_copy( content, object.*DataMember, size_t( length ) );
+        }
     };
 
     namespace schema_detail
@@ -2252,6 +2590,9 @@ namespace serialize
         // one specialized, fully constant path per case of a match field
         template <typename T, int64_t SegBase, int64_t K, typename CasePack, typename... Rest> struct match_dispatch;
 
+        // one specialized, fully constant path per bucket of an int_relative_ field
+        template <typename T, int64_t SegBase, int64_t K, typename F, int Leg, typename... Rest> struct relative_dispatch;
+
         // splice a fields<...> list in front of the remaining fields
         template <typename T, int64_t SegBase, int64_t K, typename List, typename... Rest> struct splice;
         template <typename T, int64_t SegBase, int64_t K, typename... Ls, typename... Rest> struct splice<T, SegBase, K, fields<Ls...>, Rest...>
@@ -2263,6 +2604,8 @@ namespace serialize
         {
             static consteval int64_t prefix_end() { return K; }
             static consteval int64_t max_end() { return K; }
+
+            static serialize_force_inline int64_t measure( const T & ) noexcept { return K; }
 
             static serialize_force_inline bool read( const uint8_t *, int64_t, T & ) noexcept { return true; }
 
@@ -2291,6 +2634,8 @@ namespace serialize
                     return K + F::count_bits;
                 else if constexpr ( F::kind == field_kind::dynamic )
                     return K + F::length_bits;
+                else if constexpr ( F::kind == field_kind::relative )
+                    return K + 1;
                 else
                     return runner<T, SegBase, next, Rest...>::prefix_end();
             }
@@ -2327,9 +2672,61 @@ namespace serialize
                     // the rest of the schema restarts at a byte aligned runtime base after the content
                     return K + F::bits_at( K ) + runner<T, 0, 0, Rest...>::max_end();
                 }
+                else if constexpr ( F::kind == field_kind::relative )
+                {
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::max_end();
+                }
                 else
                 {
                     return runner<T, SegBase, next, Rest...>::max_end();
+                }
+            }
+
+            // the exact serialized size in bits for this object: follows the same path selection as
+            // write (conditions, matches, counts, lengths), with every size a compile time constant
+            static serialize_force_inline int64_t measure( const T & object ) noexcept
+            {
+                if constexpr ( F::kind == field_kind::branch || F::kind == field_kind::branch_on )
+                {
+                    constexpr int64_t D = ( F::kind == field_kind::branch ) ? 1 : 0;
+                    if ( F::get( object ) )
+                    {
+                        using then_runner = typename splice<T, SegBase, K + D, typename F::then_list, Rest...>::type;
+                        return then_runner::measure( object );
+                    }
+                    else
+                    {
+                        using else_runner = typename splice<T, SegBase, K + D, typename F::else_list, Rest...>::type;
+                        return else_runner::measure( object );
+                    }
+                }
+                else if constexpr ( F::kind == field_kind::match )
+                {
+                    return match_dispatch<T, SegBase, K, typename F::cases, Rest...>::measure( F::get( object ), object );
+                }
+                else if constexpr ( F::kind == field_kind::counted )
+                {
+                    return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::measure( F::get_count( object ), object );
+                }
+                else if constexpr ( F::kind == field_kind::dynamic )
+                {
+                    const int64_t length = F::length_for_write( object );
+                    constexpr int pad = int( align_pad( K + F::length_bits ) );
+                    constexpr int64_t contentByte = ( K + F::length_bits + pad ) >> 3;
+                    const int64_t base = contentByte + length * F::unit_bytes;
+                    using rest = runner<T, 0, 0, Rest...>;
+                    return base * 8 + rest::measure( object );
+                }
+                else if constexpr ( F::kind == field_kind::relative )
+                {
+                    const uint32_t difference = F::get_curr( object ) - F::get_prev( object );
+                    const int leg = ( difference == 1 ) ? 0 : ( difference <= 6 ) ? 1 : ( difference <= 23 ) ? 2
+                                  : ( difference <= 280 ) ? 3 : ( difference <= 4377 ) ? 4 : ( difference <= 69914 ) ? 5 : 6;
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::measure( leg, object );
+                }
+                else
+                {
+                    return runner<T, SegBase, next, Rest...>::measure( object );
                 }
             }
 
@@ -2384,6 +2781,10 @@ namespace serialize
                     F::set_count( object, count );
                     return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::read( data, bytes, count, object );
                 }
+                else if constexpr ( F::kind == field_kind::relative )
+                {
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::read( data, bytes, object );
+                }
                 else if constexpr ( F::kind == field_kind::dynamic )
                 {
                     const int64_t length = int64_t( get_const<K, F::length_bits>( data ) );
@@ -2397,13 +2798,13 @@ namespace serialize
                             return false;
                     }
                     constexpr int64_t contentByte = ( K + F::length_bits + pad ) >> 3;
-                    if ( contentByte + length > bytes )
+                    if ( contentByte + length * F::unit_bytes > bytes )
                         return false;
-                    small_copy( F::dst( object ), data + contentByte, size_t( length ) );
-                    F::finalize_read( object, length );
+                    if ( !F::read_content( object, data + contentByte, length ) )
+                        return false;
                     // the rest of the schema continues at a runtime byte offset: a fresh compile time
                     // run relative to the new base, so shifts and masks stay constants
-                    const int64_t base = contentByte + length;
+                    const int64_t base = contentByte + length * F::unit_bytes;
                     using rest = runner<T, 0, 0, Rest...>;
                     if ( ( bytes - base ) * 8 < rest::prefix_end() )
                         return false;
@@ -2470,6 +2871,14 @@ namespace serialize
                     put_const<SegBase, K, F::count_bits>( words, uint64_t( count ) );
                     return counted_dispatch<T, SegBase, K + F::count_bits, F, 0, Rest...>::write( data, words, count, object );
                 }
+                else if constexpr ( F::kind == field_kind::relative )
+                {
+                    serialize_assert( F::curr_valid_for_write( object ) );
+                    const uint32_t difference = F::get_curr( object ) - F::get_prev( object );
+                    const int leg = ( difference == 1 ) ? 0 : ( difference <= 6 ) ? 1 : ( difference <= 23 ) ? 2
+                                  : ( difference <= 280 ) ? 3 : ( difference <= 4377 ) ? 4 : ( difference <= 69914 ) ? 5 : 6;
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::write( data, words, leg, difference, object );
+                }
                 else if constexpr ( F::kind == field_kind::dynamic )
                 {
                     const int64_t length = F::length_for_write( object );
@@ -2479,8 +2888,8 @@ namespace serialize
                     constexpr int pad = int( align_pad( K + F::length_bits ) );
                     constexpr int64_t contentByte = ( K + F::length_bits + pad ) >> 3;
                     flush_words<SegBase, K + F::length_bits + pad>( data, words );
-                    small_copy( data + contentByte, F::src( object ), size_t( length ) );
-                    const int64_t base = contentByte + length;
+                    F::write_content( object, data + contentByte, length );
+                    const int64_t base = contentByte + length * F::unit_bytes;
                     using rest = runner<T, 0, 0, Rest...>;
                     return base + rest::write( data + base, words, object );
                 }
@@ -2522,6 +2931,16 @@ namespace serialize
                 }
             }
 
+            static serialize_force_inline int64_t measure( int64_t count, const T & object ) noexcept
+            {
+                if ( count == I )
+                    return path::measure( object );
+                if constexpr ( I < F::max_count )
+                    return counted_dispatch<T, SegBase, K, F, I + 1, Rest...>::measure( count, object );
+                else
+                    return 0;                   // unreachable: count was asserted against max_count
+            }
+
             static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t count, T & object ) noexcept
             {
                 if ( count == I )
@@ -2555,6 +2974,11 @@ namespace serialize
 
             static consteval int64_t max_end() { return path::max_end(); }
 
+            static serialize_force_inline int64_t measure( int64_t, const T & object ) noexcept
+            {
+                return path::measure( object );
+            }
+
             static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t, T & object ) noexcept
             {
                 if ( bytes * 8 < path::prefix_end() )
@@ -2578,6 +3002,13 @@ namespace serialize
                 const int64_t a = path::max_end();
                 const int64_t b = next_case::max_end();
                 return a > b ? a : b;
+            }
+
+            static serialize_force_inline int64_t measure( int64_t value, const T & object ) noexcept
+            {
+                if ( value == C0::value )
+                    return path::measure( object );
+                return next_case::measure( value, object );
             }
 
             static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t value, T & object ) noexcept
@@ -2664,11 +3095,124 @@ namespace serialize
             static constexpr bool ok = step::ok && ref_check<typename step::seen_after, fields<Rest...>>::ok;
         };
 
+        // one fully constant path per bucket of an int_relative_ field. read walks the header bits
+        // in wire order; write and measure receive the bucket picked from the difference.
+        template <typename T, int64_t SegBase, int64_t K, typename F, int Leg, typename... Rest> struct relative_dispatch
+        {
+            static constexpr int64_t total = F::leg_total_bits( Leg );
+            using path = runner<T, SegBase, K + total, Rest...>;
+
+            static consteval int64_t max_end()
+            {
+                if constexpr ( Leg == F::num_legs - 1 )
+                {
+                    return path::max_end();
+                }
+                else
+                {
+                    const int64_t a = path::max_end();
+                    const int64_t b = relative_dispatch<T, SegBase, K, F, Leg + 1, Rest...>::max_end();
+                    return a > b ? a : b;
+                }
+            }
+
+            static serialize_force_inline int64_t measure( int leg, const T & object ) noexcept
+            {
+                if ( leg == Leg )
+                    return path::measure( object );
+                if constexpr ( Leg < F::num_legs - 1 )
+                    return relative_dispatch<T, SegBase, K, F, Leg + 1, Rest...>::measure( leg, object );
+                else
+                    return 0;                   // unreachable: the leg was computed from the difference
+            }
+
+            static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, T & object ) noexcept
+            {
+                if constexpr ( Leg < F::num_legs - 1 )
+                {
+                    if ( bytes * 8 < K + Leg + 1 )
+                        return false;
+                    if ( get_const<K + Leg, 1>( data ) != 0 )
+                    {
+                        constexpr int payload_bits = F::leg_payload_bits( Leg );
+                        uint32_t difference = 1;                                        // the one bit bucket
+                        if constexpr ( payload_bits > 0 )
+                        {
+                            if ( bytes * 8 < K + Leg + 1 + payload_bits )
+                                return false;
+                            const uint32_t raw = uint32_t( get_const<K + Leg + 1, payload_bits>( data ) );
+                            if ( raw > F::leg_max( Leg ) - F::leg_min( Leg ) )
+                                return false;
+                            difference = F::leg_min( Leg ) + raw;
+                        }
+                        // reconstruct in the unsigned domain: previous + difference overflows signed arithmetic near the type maximum
+                        F::set_curr( object, F::get_prev( object ) + difference );
+                        if ( bytes * 8 < path::prefix_end() )
+                            return false;
+                        return path::read( data, bytes, object );
+                    }
+                    return relative_dispatch<T, SegBase, K, F, Leg + 1, Rest...>::read( data, bytes, object );
+                }
+                else
+                {
+                    // the 32 bit absolute fallback, after six false bucket bits
+                    if ( bytes * 8 < K + F::leg_total_bits( Leg ) )
+                        return false;
+                    F::set_curr( object, uint32_t( get_const<K + 6, 32>( data ) ) );
+                    if ( !F::curr_greater_prev( object ) )
+                        return false;
+                    if ( bytes * 8 < path::prefix_end() )
+                        return false;
+                    return path::read( data, bytes, object );
+                }
+            }
+
+            static serialize_force_inline int64_t write( uint8_t * data, uint64_t * words, int leg, uint32_t difference, const T & object ) noexcept
+            {
+                if ( leg == Leg )
+                {
+                    constexpr int header_bits = int( F::leg_header_bits( Leg ) );
+                    put_const<SegBase, K, header_bits>( words, F::leg_header_value( Leg ) );
+                    constexpr int payload_bits = F::leg_payload_bits( Leg );
+                    if constexpr ( payload_bits > 0 )
+                    {
+                        const uint32_t payload = ( Leg == F::num_legs - 1 ) ? F::get_curr( object ) : ( difference - F::leg_min( Leg ) );
+                        put_const<SegBase, K + header_bits, payload_bits>( words, payload );
+                    }
+                    return path::write( data, words, object );
+                }
+                if constexpr ( Leg < F::num_legs - 1 )
+                    return relative_dispatch<T, SegBase, K, F, Leg + 1, Rest...>::write( data, words, leg, difference, object );
+                else
+                    return 0;                   // unreachable: the leg was computed from the difference
+            }
+        };
+
+        // back references from a relative field must point at an unconditionally serialized member
+        template <typename Seen, typename F> struct ref_step<Seen, F, field_kind::relative>
+        {
+            static constexpr bool ok = path_in<typename F::referenced, Seen>::value;
+            using seen_after = typename paths_concat<Seen, typename F::writes>::type;
+        };
+
         template <typename T, typename List> struct runner_of;
         template <typename T, typename... Fs> struct runner_of<T, fields<Fs...>> { using type = runner<T, 0, 0, Fs...>; };
 
-        template <typename List> struct first_field_of;
-        template <typename F, typename... Fs> struct first_field_of<fields<F, Fs...>> { using type = F; };
+        // the schema's object type comes from the first field that names one: fields with no
+        // member (const_, reserved_, align) are transparent to the deduction
+        template <typename F> concept names_object_type = requires { typename F::object_type; };
+
+        template <typename List> struct first_object_type;
+        template <typename F, typename... Fs> requires names_object_type<F>
+        struct first_object_type<fields<F, Fs...>>
+        {
+            using type = typename F::object_type;
+        };
+        template <typename F, typename... Fs> requires ( !names_object_type<F> )
+        struct first_object_type<fields<F, Fs...>>
+        {
+            using type = typename first_object_type<fields<Fs...>>::type;
+        };
     }
 
     /**
@@ -2694,7 +3238,7 @@ namespace serialize
         /// The flattened field list: object fields spliced in place, only leaf/bytes/branch fields remain.
         using field_list = schema_detail::flatten_t<fields<FirstField, RestFields...>>;
 
-        using object_type = typename schema_detail::first_field_of<field_list>::type::object_type;
+        using object_type = typename schema_detail::first_object_type<field_list>::type;
 
     private:
 
@@ -2707,6 +3251,24 @@ namespace serialize
 
         /// The size in bytes of the longest path through the schema. Size write buffers from this (plus the 8 byte allocation slack).
         static constexpr int64_t MaxBytes = ( MaxBits + 7 ) / 8;
+
+        /**
+            The exact serialized size in bits for this object: follows the same branches, matches,
+            counts and lengths a Write of this object would take, without touching memory. Unlike
+            MeasureStream this is exact, not conservative — alignment padding is computed from real
+            compile time offsets.
+         */
+
+        [[nodiscard]] static serialize_force_inline int64_t MeasureBits( const object_type & object ) noexcept
+        {
+            return root::measure( object );
+        }
+
+        /// The exact serialized size in bytes for this object.
+        [[nodiscard]] static serialize_force_inline int64_t MeasureBytes( const object_type & object ) noexcept
+        {
+            return ( root::measure( object ) + 7 ) / 8;
+        }
 
         /**
             Read the schema from bitpacked data (the generated equivalent of a serialize method with a ReadStream).
@@ -4405,6 +4967,7 @@ inline void test_schema()
         const int64_t macroBytes = writeStream.GetBytesProcessed();
 
         uint8_t schema_buffer[64 + 8] = { 0 };
+        serialize_check( SchemaTestSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
         const int64_t schemaBytes = SchemaTestSchema::Write( schema_buffer, 64, packet );
         serialize_check( schemaBytes == macroBytes );
         serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
@@ -4531,6 +5094,7 @@ inline void test_schema_object()
         const int64_t macroBytes = writeStream.GetBytesProcessed();
 
         uint8_t schema_buffer[32 + 8] = { 0 };
+        serialize_check( SchemaBodySchema::MeasureBits( body ) == writeStream.GetBitsProcessed() );
         const int64_t schemaBytes = SchemaBodySchema::Write( schema_buffer, 32, body );
         serialize_check( schemaBytes == macroBytes );
         serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
@@ -4599,6 +5163,7 @@ inline void test_schema_array()
     const int64_t macroBytes = writeStream.GetBytesProcessed();
 
     uint8_t schema_buffer[64 + 8] = { 0 };
+    serialize_check( SchemaArrayPacketSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
     const int64_t schemaBytes = SchemaArrayPacketSchema::Write( schema_buffer, 64, packet );
     serialize_check( schemaBytes == macroBytes );
     serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
@@ -4699,6 +5264,7 @@ inline void test_schema_dynamic()
         const int64_t macroBytes = writeStream.GetBytesProcessed();
 
         uint8_t schema_buffer[128 + 8] = { 0 };
+        serialize_check( SchemaDynSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
         const int64_t schemaBytes = SchemaDynSchema::Write( schema_buffer, 128, packet );
         serialize_check( schemaBytes == macroBytes );
         serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
@@ -4866,6 +5432,7 @@ inline void test_schema_backref()
         const int64_t macroBytes = writeStream.GetBytesProcessed();
 
         uint8_t schema_buffer[64 + 8] = { 0 };
+        serialize_check( SchemaBackrefSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
         const int64_t schemaBytes = SchemaBackrefSchema::Write( schema_buffer, 64, packet );
         serialize_check( schemaBytes == macroBytes );
         serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
@@ -4902,6 +5469,305 @@ inline void test_schema_backref()
             memset( (void*) &t, 0, sizeof( t ) );
             serialize_check( SchemaBackrefSchema::Read( macro_buffer, truncate, t ) == false );
         }
+    }
+}
+
+// the tier one extras: protocol constants, reserved bits, enums, compressed floats, wide strings.
+// each must be byte-identical to its stream twin, and MeasureBits must be exact.
+
+enum class SchemaMode : uint32_t { Idle, Walk, Run, Fly };
+
+struct SchemaExtrasPacket
+{
+    SchemaMode mode;
+    float health;
+    wchar_t label[9];
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        uint32_t magic = 0x5A17;
+        serialize_bits( stream, magic, 16 );
+        if ( Stream::IsReading && magic != 0x5A17 )
+            return false;
+
+        uint32_t reserved = 0;
+        serialize_bits( stream, reserved, 5 );
+        if ( Stream::IsReading && reserved != 0 )
+            return false;
+
+        int mode_value = int( mode );
+        serialize_int( stream, mode_value, 0, 3 );
+        if ( Stream::IsReading )
+            mode = SchemaMode( mode_value );
+
+        serialize_compressed_float( stream, health, 0.0f, 100.0f, 0.5f );
+
+        // the schema wide string wire: length, align, then 32 bit code points
+        int length = 0;
+        if ( Stream::IsWriting )
+            length = (int) wcslen( label );
+        serialize_int( stream, length, 0, 8 );
+        serialize_align( stream );
+        for ( int i = 0; i < length; i++ )
+        {
+            uint32_t code_point = 0;
+            if ( Stream::IsWriting )
+                code_point = uint32_t( label[i] );
+            serialize_bits( stream, code_point, 32 );
+            if ( Stream::IsReading )
+                label[i] = wchar_t( code_point );
+        }
+        if ( Stream::IsReading )
+            label[length] = L'\0';
+
+        serialize_bits( stream, tail, 32 );
+        return true;
+    }
+};
+
+using SchemaExtrasSchema = serialize::schema<
+    serialize::const_<0x5A17, 16>,
+    serialize::reserved_<5>,
+    serialize::enum_<&SchemaExtrasPacket::mode, SchemaMode::Fly>,
+    serialize::compressed_float_<&SchemaExtrasPacket::health, 0.0f, 100.0f, 0.5f>,
+    serialize::wstring_<&SchemaExtrasPacket::label>,
+    serialize::bits<&SchemaExtrasPacket::tail, 32> >;
+
+// compressed float [0,100] at 0.5 resolution: 200 steps, 8 bits
+static_assert( SchemaExtrasSchema::MaxBits == 16 + 5 + 2 + 8 + 4 + 5 + 8 * 32 + 32 );
+
+inline void test_schema_extras()
+{
+    SchemaExtrasPacket packet;
+    memset( (void*) &packet, 0, sizeof( packet ) );
+    packet.mode = SchemaMode::Run;
+    packet.health = 62.5f;                                  // exactly on a 0.5 step
+    serialize_copy_wstring( packet.label, L"мир", sizeof( packet.label ) / sizeof( wchar_t ) );
+    packet.tail = 0xFEEDF00D;
+
+    uint8_t macro_buffer[64 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+    serialize::WriteStream writeStream( macro_buffer, 64 );
+    serialize_check( packet.Serialize( writeStream ) == true );
+    writeStream.Flush();
+    const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+    serialize_check( SchemaExtrasSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
+
+    uint8_t schema_buffer[64 + 8] = { 0 };
+    const int64_t schemaBytes = SchemaExtrasSchema::Write( schema_buffer, 64, packet );
+    serialize_check( schemaBytes == macroBytes );
+    serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+    SchemaExtrasPacket out;
+    memset( (void*) &out, 0, sizeof( out ) );
+    serialize_check( SchemaExtrasSchema::Read( macro_buffer, macroBytes, out ) == true );
+    serialize_check( out.mode == packet.mode );
+    serialize_check( out.health == packet.health );
+    serialize_check( wcscmp( out.label, packet.label ) == 0 );
+    serialize_check( out.tail == packet.tail );
+
+    SchemaExtrasPacket out2;
+    memset( (void*) &out2, 0, sizeof( out2 ) );
+    serialize::ReadStream readStream( schema_buffer, schemaBytes );
+    serialize_check( out2.Serialize( readStream ) == true );
+    serialize_check( out2.tail == packet.tail );
+
+    // a wrong protocol constant must be rejected
+    {
+        uint8_t buffer[64 + 8];
+        memcpy( buffer, macro_buffer, sizeof( buffer ) );
+        buffer[0] ^= 0x01;
+        SchemaExtrasPacket t;
+        memset( (void*) &t, 0, sizeof( t ) );
+        serialize_check( SchemaExtrasSchema::Read( buffer, macroBytes, t ) == false );
+    }
+
+    // nonzero reserved bits must be rejected (reserved_<5> sits at bits [16,21))
+    {
+        uint8_t buffer[64 + 8];
+        memcpy( buffer, macro_buffer, sizeof( buffer ) );
+        buffer[2] ^= 0x02;
+        SchemaExtrasPacket t;
+        memset( (void*) &t, 0, sizeof( t ) );
+        serialize_check( SchemaExtrasSchema::Read( buffer, macroBytes, t ) == false );
+    }
+}
+
+// int_relative_ must be byte-identical to serialize_int_relative for every bucket
+
+struct SchemaRelativePacket
+{
+    int32_t base;
+    int32_t next1;
+    int32_t next2;
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_int( stream, base, 0, 1000 );
+        serialize_int_relative( stream, base, next1 );
+        serialize_int_relative( stream, next1, next2 );
+        serialize_bits( stream, tail, 16 );
+        return true;
+    }
+};
+
+using SchemaRelativeSchema = serialize::schema<
+    serialize::int_<&SchemaRelativePacket::base, 0, 1000>,
+    serialize::int_relative_<&SchemaRelativePacket::base, &SchemaRelativePacket::next1>,
+    serialize::int_relative_<&SchemaRelativePacket::next1, &SchemaRelativePacket::next2>,
+    serialize::bits<&SchemaRelativePacket::tail, 16> >;
+
+inline void test_schema_relative()
+{
+    const int differences[8] = { 1, 5, 20, 200, 4000, 60000, 1000000, 3 };      // every bucket plus the fallback
+
+    for ( int a = 0; a < 8; a++ )
+    {
+        for ( int b = 0; b < 8; b += 3 )
+        {
+            SchemaRelativePacket packet;
+            memset( (void*) &packet, 0, sizeof( packet ) );
+            packet.base = 10;
+            packet.next1 = packet.base + differences[a];
+            packet.next2 = packet.next1 + differences[b];
+            packet.tail = 0xABCD;
+
+            uint8_t macro_buffer[32 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+            serialize::WriteStream writeStream( macro_buffer, 32 );
+            serialize_check( packet.Serialize( writeStream ) == true );
+            writeStream.Flush();
+            const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+            serialize_check( SchemaRelativeSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
+
+            uint8_t schema_buffer[32 + 8] = { 0 };
+            const int64_t schemaBytes = SchemaRelativeSchema::Write( schema_buffer, 32, packet );
+            serialize_check( schemaBytes == macroBytes );
+            serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+            SchemaRelativePacket out;
+            memset( (void*) &out, 0, sizeof( out ) );
+            serialize_check( SchemaRelativeSchema::Read( macro_buffer, macroBytes, out ) == true );
+            serialize_check( out.base == packet.base );
+            serialize_check( out.next1 == packet.next1 );
+            serialize_check( out.next2 == packet.next2 );
+            serialize_check( out.tail == packet.tail );
+
+            SchemaRelativePacket out2;
+            memset( (void*) &out2, 0, sizeof( out2 ) );
+            serialize::ReadStream readStream( schema_buffer, schemaBytes );
+            serialize_check( out2.Serialize( readStream ) == true );
+            serialize_check( out2.next2 == packet.next2 );
+        }
+    }
+
+    // the 32 bit fallback must reject values that violate the previous < current contract
+    {
+        uint8_t buffer[32 + 8] = { 0 };
+        serialize::WriteStream writeStream( buffer, 32 );
+        uint32_t base_raw = 100;
+        writeStream.SerializeBits( base_raw, 10 );          // base = 100
+        uint32_t six_false_bools = 0;
+        writeStream.SerializeBits( six_false_bools, 6 );
+        uint32_t bad_current = 50;                          // 50 <= 100: must be rejected
+        writeStream.SerializeBits( bad_current, 32 );
+        writeStream.Flush();
+
+        SchemaRelativePacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaRelativeSchema::Read( buffer, 32, out ) == false );
+    }
+}
+
+// dynamic and counted fields compose through object, and fixed arrays may contain dynamic
+// content: the flattened schema is one linear list, so a string inside an array element simply
+// hands the rest of the elements off to a runtime base.
+
+struct SchemaPlayer
+{
+    char name[13];
+    int32_t score;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_string( stream, name, (int) sizeof( name ) );
+        serialize_int( stream, score, 0, 100000 );
+        return true;
+    }
+};
+
+using SchemaPlayerSchema = serialize::schema<
+    serialize::string<&SchemaPlayer::name>,
+    serialize::int_<&SchemaPlayer::score, 0, 100000> >;
+
+struct SchemaTeamPacket
+{
+    SchemaPlayer captain;
+    SchemaPlayer roster[3];
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_object( stream, captain );
+        for ( int i = 0; i < 3; i++ )
+            serialize_object( stream, roster[i] );
+        serialize_bits( stream, tail, 32 );
+        return true;
+    }
+};
+
+using SchemaTeamSchema = serialize::schema<
+    serialize::object<&SchemaTeamPacket::captain, SchemaPlayerSchema>,
+    serialize::array<&SchemaTeamPacket::roster, SchemaPlayerSchema>,
+    serialize::bits<&SchemaTeamPacket::tail, 32> >;
+
+inline void test_schema_nested_dynamic()
+{
+    SchemaTeamPacket packet;
+    memset( (void*) &packet, 0, sizeof( packet ) );
+    serialize_copy_string( packet.captain.name, "skipper", sizeof( packet.captain.name ) );
+    packet.captain.score = 91234;
+    const char * names[3] = { "", "ada", "grace hopper" };
+    for ( int i = 0; i < 3; i++ )
+    {
+        serialize_copy_string( packet.roster[i].name, names[i], sizeof( packet.roster[i].name ) );
+        packet.roster[i].score = i * 1000 + 1;
+    }
+    packet.tail = 0x7EA31337;
+
+    uint8_t macro_buffer[128 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+    serialize::WriteStream writeStream( macro_buffer, 128 );
+    serialize_check( packet.Serialize( writeStream ) == true );
+    writeStream.Flush();
+    const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+    serialize_check( SchemaTeamSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
+
+    uint8_t schema_buffer[128 + 8] = { 0 };
+    const int64_t schemaBytes = SchemaTeamSchema::Write( schema_buffer, 128, packet );
+    serialize_check( schemaBytes == macroBytes );
+    serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+    SchemaTeamPacket out;
+    memset( (void*) &out, 0, sizeof( out ) );
+    serialize_check( SchemaTeamSchema::Read( macro_buffer, macroBytes, out ) == true );
+    serialize_check( strcmp( out.captain.name, packet.captain.name ) == 0 );
+    serialize_check( out.captain.score == packet.captain.score );
+    for ( int i = 0; i < 3; i++ )
+    {
+        serialize_check( strcmp( out.roster[i].name, packet.roster[i].name ) == 0 );
+        serialize_check( out.roster[i].score == packet.roster[i].score );
+    }
+    serialize_check( out.tail == packet.tail );
+
+    // truncated packets must fail cleanly at every prefix length
+    for ( int64_t truncate = 0; truncate < macroBytes; truncate++ )
+    {
+        SchemaTeamPacket t;
+        memset( (void*) &t, 0, sizeof( t ) );
+        serialize_check( SchemaTeamSchema::Read( macro_buffer, truncate, t ) == false );
     }
 }
 
@@ -5161,6 +6027,9 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_array );
         SERIALIZE_RUN_TEST( test_schema_dynamic );
         SERIALIZE_RUN_TEST( test_schema_backref );
+        SERIALIZE_RUN_TEST( test_schema_extras );
+        SERIALIZE_RUN_TEST( test_schema_relative );
+        SERIALIZE_RUN_TEST( test_schema_nested_dynamic );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

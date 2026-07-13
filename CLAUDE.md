@@ -67,7 +67,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 23 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 26 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
@@ -108,6 +108,16 @@ best-of-5 runs, heap-buffered benchmark). Kept:
   directions), and the zero-overhead codegen is pinned by the codegen_audit
   CI gate (straight-line call-free code, e.g. the audit packet reads in 57
   instructions and writes in 33 on arm64 clang).
+- **Protocol plumbing fields**: const_ (magic/version, read rejects
+  mismatch), reserved_ (zeros, read rejects nonzero), enum_ (range
+  validated), compressed_float_ (quantization constants folded at compile
+  time), wstring_ (wire adds an align before the 32 bit code points, unlike
+  serialize_wstring — documented), int_relative_ (wire identical to
+  serialize_int_relative; forks the layout tree seven ways). Schema
+  MeasureBits/MeasureBytes give exact sizes, unlike the conservative
+  MeasureStream. Dynamic and counted fields compose through object and
+  fixed arrays (a string inside an array element just hands the remaining
+  elements to a runtime base).
 - **Back references (branch_on, match/case_)**: decisions from members
   serialized earlier in the schema, zero wire bits, layout tree still forks
   at compile time. Forward references are compile errors: schema<>
