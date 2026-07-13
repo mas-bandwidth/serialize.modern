@@ -1431,7 +1431,7 @@ namespace serialize
     /// How the schema runner treats a field: an inline bitpacked value, an aligned byte block, a
     /// conditional branch, a bounded count with one specialized path per value, or a runtime-length
     /// section after which the schema continues at a runtime byte offset.
-    enum class field_kind { leaf, bytes, branch, counted, dynamic };
+    enum class field_kind { leaf, bytes, branch, branch_on, match, counted, dynamic };
 
     namespace schema_detail
     {
@@ -1755,6 +1755,57 @@ namespace serialize
         static serialize_force_inline void set( object_type & object, bool value ) noexcept { object.*Member = value; }
     };
 
+    /**
+        Branch on a bool member serialized EARLIER in the schema: a back reference. Consumes no wire
+        bits — by the time the runner reaches this point the member has already been decoded, so the
+        condition reads it from the object on both sides. The layout tree still forks at compile
+        time, exactly like branch.
+        IMPORTANT: the member must be serialized by an earlier field in the schema, or on read the
+        condition sees an undecoded value. This is the same ordering discipline a hand written
+        serialize method needs when it branches on a previously serialized field.
+     */
+    template <auto Member, typename ThenFields, typename ElseFields> struct branch_on
+    {
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+        using then_list = ThenFields;
+        using else_list = ElseFields;
+
+        static constexpr field_kind kind = field_kind::branch_on;
+
+        static consteval int64_t bits_at( int64_t ) { return 0; }       // back reference: no wire bits
+
+        static serialize_force_inline bool get( const object_type & object ) noexcept { return object.*Member; }
+    };
+
+    /// One case of a match: if the matched member equals Value, serialize these fields.
+    template <int64_t Value, typename... Fields_> struct case_
+    {
+        static constexpr int64_t value = Value;
+        using list = fields<Fields_...>;
+    };
+
+    /**
+        Switch on an integral member serialized EARLIER in the schema: an N-way back reference,
+        consuming no wire bits. Each case forks the layout tree at compile time; a value matching no
+        case serializes nothing and continues with the rest of the schema (an implicit empty default),
+        identically on write and read, so the wire stays symmetric.
+        IMPORTANT: the member must be serialized by an earlier field in the schema.
+     */
+    /// The cases of a match, as a pack the runner can peel. Users write case_ directly; this is internal glue.
+    template <typename... Cases> struct case_pack {};
+
+    template <auto Member, typename... Cases> struct match
+    {
+        using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
+        using cases = case_pack<Cases...>;
+
+        static constexpr field_kind kind = field_kind::match;
+
+        static consteval int64_t bits_at( int64_t ) { return 0; }       // back reference: no wire bits
+
+        static serialize_force_inline int64_t get( const object_type & object ) noexcept { return int64_t( object.*Member ); }
+    };
+
     namespace schema_detail
     {
         // nest<Outer, F>: the field F of an inner object, re-targeted at the outer object through
@@ -1816,6 +1867,39 @@ namespace serialize
 
             static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( object.*Outer ); }
             static serialize_force_inline void set( object_type & object, bool value ) noexcept { F::set( object.*Outer, value ); }
+        };
+
+        template <auto Outer, typename F> struct nest<Outer, F, field_kind::branch_on>
+        {
+            using object_type = typename member_traits<decltype(Outer)>::object_type;
+            using then_list = wrap_t<Outer, typename F::then_list>;
+            using else_list = wrap_t<Outer, typename F::else_list>;
+
+            static constexpr field_kind kind = field_kind::branch_on;
+
+            static consteval int64_t bits_at( int64_t ) { return 0; }
+
+            static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( object.*Outer ); }
+        };
+
+        template <int64_t V, typename List> struct case_from_list;
+
+        template <auto Outer, typename CasePack> struct wrap_cases;
+        template <auto Outer, typename... Cs> struct wrap_cases<Outer, case_pack<Cs...>>
+        {
+            using type = case_pack<typename case_from_list<Cs::value, wrap_t<Outer, typename Cs::list>>::type...>;
+        };
+
+        template <auto Outer, typename F> struct nest<Outer, F, field_kind::match>
+        {
+            using object_type = typename member_traits<decltype(Outer)>::object_type;
+            using cases = typename wrap_cases<Outer, typename F::cases>::type;
+
+            static constexpr field_kind kind = field_kind::match;
+
+            static consteval int64_t bits_at( int64_t ) { return 0; }
+
+            static serialize_force_inline int64_t get( const object_type & object ) noexcept { return F::get( object.*Outer ); }
         };
 
         // nest_at<Member, Index, F>: the field F of one element of a C array member. this is how
@@ -2046,6 +2130,25 @@ namespace serialize
             using type = typename cons<branch<M, flatten_t<A>, flatten_t<B>>, flatten_t<fields<Rest...>>>::type;
         };
 
+        template <auto M, typename A, typename B, typename... Rest> struct flatten<fields<branch_on<M, A, B>, Rest...>>
+        {
+            using type = typename cons<branch_on<M, flatten_t<A>, flatten_t<B>>, flatten_t<fields<Rest...>>>::type;
+        };
+
+        // rebuild a case_ from a flattened (or wrapped) field list (declared above for wrap_cases)
+        template <int64_t V, typename... Fs> struct case_from_list<V, fields<Fs...>> { using type = case_<V, Fs...>; };
+
+        template <typename C> struct flatten_case;
+        template <int64_t V, typename... Fs> struct flatten_case<case_<V, Fs...>>
+        {
+            using type = typename case_from_list<V, flatten_t<fields<Fs...>>>::type;
+        };
+
+        template <auto M, typename... Cs, typename... Rest> struct flatten<fields<match<M, Cs...>, Rest...>>
+        {
+            using type = typename cons<match<M, typename flatten_case<Cs>::type...>, flatten_t<fields<Rest...>>>::type;
+        };
+
         template <auto M, typename Inner, typename... Rest> struct flatten<fields<object<M, Inner>, Rest...>>
         {
             using expanded = wrap_t<M, flatten_t<typename field_list_of<Inner>::type>>;
@@ -2087,6 +2190,9 @@ namespace serialize
         // one specialized, fully constant path per possible count of an array_n field
         template <typename T, int64_t SegBase, int64_t K, typename F, int64_t I, typename... Rest> struct counted_dispatch;
 
+        // one specialized, fully constant path per case of a match field
+        template <typename T, int64_t SegBase, int64_t K, typename CasePack, typename... Rest> struct match_dispatch;
+
         // splice a fields<...> list in front of the remaining fields
         template <typename T, int64_t SegBase, int64_t K, typename List, typename... Rest> struct splice;
         template <typename T, int64_t SegBase, int64_t K, typename... Ls, typename... Rest> struct splice<T, SegBase, K, fields<Ls...>, Rest...>
@@ -2120,6 +2226,8 @@ namespace serialize
             {
                 if constexpr ( F::kind == field_kind::branch )
                     return K + 1;
+                else if constexpr ( F::kind == field_kind::branch_on || F::kind == field_kind::match )
+                    return K;
                 else if constexpr ( F::kind == field_kind::counted )
                     return K + F::count_bits;
                 else if constexpr ( F::kind == field_kind::dynamic )
@@ -2138,6 +2246,18 @@ namespace serialize
                     const int64_t a = then_runner::max_end();
                     const int64_t b = else_runner::max_end();
                     return a > b ? a : b;
+                }
+                else if constexpr ( F::kind == field_kind::branch_on )
+                {
+                    using then_runner = typename splice<T, SegBase, K, typename F::then_list, Rest...>::type;
+                    using else_runner = typename splice<T, SegBase, K, typename F::else_list, Rest...>::type;
+                    const int64_t a = then_runner::max_end();
+                    const int64_t b = else_runner::max_end();
+                    return a > b ? a : b;
+                }
+                else if constexpr ( F::kind == field_kind::match )
+                {
+                    return match_dispatch<T, SegBase, K, typename F::cases, Rest...>::max_end();
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
@@ -2174,6 +2294,28 @@ namespace serialize
                             return false;
                         return else_runner::read( data, bytes, object );
                     }
+                }
+                else if constexpr ( F::kind == field_kind::branch_on )
+                {
+                    // back reference: the condition member was decoded by an earlier field
+                    if ( F::get( object ) )
+                    {
+                        using then_runner = typename splice<T, SegBase, K, typename F::then_list, Rest...>::type;
+                        if ( bytes * 8 < then_runner::prefix_end() )
+                            return false;
+                        return then_runner::read( data, bytes, object );
+                    }
+                    else
+                    {
+                        using else_runner = typename splice<T, SegBase, K, typename F::else_list, Rest...>::type;
+                        if ( bytes * 8 < else_runner::prefix_end() )
+                            return false;
+                        return else_runner::read( data, bytes, object );
+                    }
+                }
+                else if constexpr ( F::kind == field_kind::match )
+                {
+                    return match_dispatch<T, SegBase, K, typename F::cases, Rest...>::read( data, bytes, F::get( object ), object );
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
@@ -2243,6 +2385,23 @@ namespace serialize
                         using else_runner = typename splice<T, SegBase, K + 1, typename F::else_list, Rest...>::type;
                         return else_runner::write( data, words, object );
                     }
+                }
+                else if constexpr ( F::kind == field_kind::branch_on )
+                {
+                    if ( F::get( object ) )
+                    {
+                        using then_runner = typename splice<T, SegBase, K, typename F::then_list, Rest...>::type;
+                        return then_runner::write( data, words, object );
+                    }
+                    else
+                    {
+                        using else_runner = typename splice<T, SegBase, K, typename F::else_list, Rest...>::type;
+                        return else_runner::write( data, words, object );
+                    }
+                }
+                else if constexpr ( F::kind == field_kind::match )
+                {
+                    return match_dispatch<T, SegBase, K, typename F::cases, Rest...>::write( data, words, F::get( object ), object );
                 }
                 else if constexpr ( F::kind == field_kind::counted )
                 {
@@ -2326,6 +2485,58 @@ namespace serialize
                     return counted_dispatch<T, SegBase, K, F, I + 1, Rest...>::write( data, words, count, object );
                 else
                     return 0;                   // unreachable: count was asserted against max_count
+            }
+        };
+
+        // a value equal to a case selects that case's fully constant path; a value matching no case
+        // serializes nothing and continues with the rest of the schema, identically on read and write
+        template <typename T, int64_t SegBase, int64_t K, typename... Rest> struct match_dispatch<T, SegBase, K, case_pack<>, Rest...>
+        {
+            using path = typename splice<T, SegBase, K, fields<>, Rest...>::type;
+
+            static consteval int64_t max_end() { return path::max_end(); }
+
+            static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t, T & object ) noexcept
+            {
+                if ( bytes * 8 < path::prefix_end() )
+                    return false;
+                return path::read( data, bytes, object );
+            }
+
+            static serialize_force_inline int64_t write( uint8_t * data, uint64_t * words, int64_t, const T & object ) noexcept
+            {
+                return path::write( data, words, object );
+            }
+        };
+
+        template <typename T, int64_t SegBase, int64_t K, typename C0, typename... Cs, typename... Rest> struct match_dispatch<T, SegBase, K, case_pack<C0, Cs...>, Rest...>
+        {
+            using path = typename splice<T, SegBase, K, typename C0::list, Rest...>::type;
+            using next_case = match_dispatch<T, SegBase, K, case_pack<Cs...>, Rest...>;
+
+            static consteval int64_t max_end()
+            {
+                const int64_t a = path::max_end();
+                const int64_t b = next_case::max_end();
+                return a > b ? a : b;
+            }
+
+            static serialize_force_inline bool read( const uint8_t * data, int64_t bytes, int64_t value, T & object ) noexcept
+            {
+                if ( value == C0::value )
+                {
+                    if ( bytes * 8 < path::prefix_end() )
+                        return false;
+                    return path::read( data, bytes, object );
+                }
+                return next_case::read( data, bytes, value, object );
+            }
+
+            static serialize_force_inline int64_t write( uint8_t * data, uint64_t * words, int64_t value, const T & object ) noexcept
+            {
+                if ( value == C0::value )
+                    return path::write( data, words, object );
+                return next_case::write( data, words, value, object );
             }
         };
 
@@ -4405,6 +4616,115 @@ inline void test_schema_dynamic()
     }
 }
 
+// back references: branch_on and match make decisions from members serialized earlier in the
+// schema, consuming no wire bits. wire identical to a serialize method that branches or switches
+// on a previously serialized field.
+
+struct SchemaBackrefPacket
+{
+    bool hasVelocity;
+    uint32_t type;
+    SchemaVec position;
+    SchemaVec velocity;
+    uint32_t a;
+    float b;
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_bool( stream, hasVelocity );
+        serialize_bits( stream, type, 2 );
+        serialize_object( stream, position );
+        if ( hasVelocity )
+        {
+            serialize_object( stream, velocity );
+        }
+        switch ( type )
+        {
+            case 1: serialize_bits( stream, a, 16 ); break;
+            case 2: serialize_float( stream, b ); break;
+            default: break;                                     // 0 and 3 serialize nothing
+        }
+        serialize_bits( stream, tail, 32 );
+        return true;
+    }
+};
+
+using SchemaBackrefSchema = serialize::schema<
+    serialize::bool_<&SchemaBackrefPacket::hasVelocity>,
+    serialize::bits<&SchemaBackrefPacket::type, 2>,
+    serialize::object<&SchemaBackrefPacket::position, SchemaVecSchema>,
+    serialize::branch_on<&SchemaBackrefPacket::hasVelocity,
+        serialize::fields< serialize::object<&SchemaBackrefPacket::velocity, SchemaVecSchema> >,
+        serialize::fields<> >,
+    serialize::match<&SchemaBackrefPacket::type,
+        serialize::case_<1, serialize::bits<&SchemaBackrefPacket::a, 16>>,
+        serialize::case_<2, serialize::float_<&SchemaBackrefPacket::b>>>,
+    serialize::bits<&SchemaBackrefPacket::tail, 32> >;
+
+// longest path: 1 + 2 + 96 + 96 (velocity) + 32 (float case) + 32 = 259
+static_assert( SchemaBackrefSchema::MaxBits == 259 );
+
+inline void test_schema_backref()
+{
+    for ( int variant = 0; variant < 8; variant++ )
+    {
+        SchemaBackrefPacket packet;
+        memset( (void*) &packet, 0, sizeof( packet ) );
+        packet.hasVelocity = ( variant & 4 ) != 0;
+        packet.type = uint32_t( variant & 3 );
+        packet.position.x = 1.0f; packet.position.y = 2.0f; packet.position.z = 3.0f;
+        packet.velocity.x = -4.0f; packet.velocity.y = -5.0f; packet.velocity.z = -6.0f;
+        packet.a = 0xBEEF;
+        packet.b = 2.5f;
+        packet.tail = 0x12345678;
+
+        uint8_t macro_buffer[64 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+        serialize::WriteStream writeStream( macro_buffer, 64 );
+        serialize_check( packet.Serialize( writeStream ) == true );
+        writeStream.Flush();
+        const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+        uint8_t schema_buffer[64 + 8] = { 0 };
+        const int64_t schemaBytes = SchemaBackrefSchema::Write( schema_buffer, 64, packet );
+        serialize_check( schemaBytes == macroBytes );
+        serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+        // schema reads the macro bytes
+        SchemaBackrefPacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaBackrefSchema::Read( macro_buffer, macroBytes, out ) == true );
+        serialize_check( out.hasVelocity == packet.hasVelocity );
+        serialize_check( out.type == packet.type );
+        serialize_check( out.position.x == packet.position.x );
+        if ( packet.hasVelocity )
+        {
+            serialize_check( out.velocity.x == packet.velocity.x );
+            serialize_check( out.velocity.z == packet.velocity.z );
+        }
+        if ( packet.type == 1 )
+            serialize_check( out.a == packet.a );
+        if ( packet.type == 2 )
+            serialize_check( out.b == packet.b );
+        serialize_check( out.tail == packet.tail );
+
+        // the macros read the schema bytes
+        SchemaBackrefPacket out2;
+        memset( (void*) &out2, 0, sizeof( out2 ) );
+        serialize::ReadStream readStream( schema_buffer, schemaBytes );
+        serialize_check( out2.Serialize( readStream ) == true );
+        serialize_check( out2.tail == packet.tail );
+
+        // truncated packets must fail cleanly at every prefix length
+        for ( int64_t truncate = 0; truncate < macroBytes; truncate++ )
+        {
+            SchemaBackrefPacket t;
+            memset( (void*) &t, 0, sizeof( t ) );
+            serialize_check( SchemaBackrefSchema::Read( macro_buffer, truncate, t ) == false );
+        }
+    }
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -4660,6 +4980,7 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_object );
         SERIALIZE_RUN_TEST( test_schema_array );
         SERIALIZE_RUN_TEST( test_schema_dynamic );
+        SERIALIZE_RUN_TEST( test_schema_backref );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

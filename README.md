@@ -162,8 +162,17 @@ Measured on a packet mixing a string, a runtime byte block and a runtime-count a
 (lengths and counts varying unpredictably): schema reads 240 M packets/s vs 61 M for the stream
 path — 3.9x. Unbounded collections stay on the streams.
 
+Decisions can also back-reference values serialized earlier in the schema, consuming no wire
+bits: `branch_on<&P::flag, Then, Else>` branches on a previously serialized bool, and
+`match<&P::type, case_<V, ...>...>` switches on a previously serialized integer (a value matching
+no case serializes nothing, identically on write and read). By the time the runner reaches the
+decision point the referenced member has already been decoded, so the layout tree still forks
+entirely at compile time — the member must be serialized by an earlier field, the same ordering
+discipline a hand written serialize method needs.
+
 Full field vocabulary: `bits`, `int_`, `int64`, `bool_`, `float_`, `double_`, `align`, `bytes`,
-`branch`, `object`, `array`, `bits_array`, `array_n`, `string`, `bytes_n`.
+`branch`, `branch_on`, `match`/`case_`, `object`, `array`, `bits_array`, `array_n`, `string`,
+`bytes_n`.
 
 The zero-overhead property is enforced in CI: a codegen audit disassembles the generated schema
 Read/Write functions on every pull request and fails if calls, loops or instruction-count blowups
