@@ -161,6 +161,11 @@ The wire format is identical. What changed:
 * **C++23 internals.** `std::bit_width`, `std::bit_cast`, `std::byteswap` and `std::endian` replace the platform macros, compiler builtins and memcpy punning; the serialize macros use `if constexpr`; the bit math is constexpr and usable in `static_assert`.
 * **The hot core is explicitly force-inlined**, which measures significantly faster on the stream read and write paths.
 * `FlushBits` is still required after writing, exactly as in classic serialize.
+* Classic's `read_*`/`write_*` macro families are removed. For separate read and write functions,
+  alias the stream type — `using Stream = serialize::ReadStream;` — and the unified `serialize_*`
+  macros work unchanged.
+* The serialize macros' internal temporaries use reserved-style names (`serialize_temp_*`), so a
+  variable named e.g. `uint64_value` can no longer be silently shadowed into serializing zero.
 
 # Performance
 
