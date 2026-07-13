@@ -336,7 +336,22 @@ Benchmark epistemology, learned the hard way:
   write path is unchecked (pre-measure with MeasureStream or size
   conservatively). The read path validates at runtime in release and drops
   invalid data, because network input is the trust boundary. Do not propose
-  hardened/checked write modes.
+  hardened/checked write modes. The failure-mode analysis behind the rule
+  (owner ruling, July 2026): every action a checked release write could
+  take is worse than the unchecked write. Clamping writes silently wrong
+  data that PASSES read validation — strictly worse than garbage, which
+  the reader rejects loudly. Returning false at the write site gives the
+  caller nothing actionable (the bug already happened upstream; the
+  serializer is the messenger) and converts value bugs into phantom packet
+  drops, while adding a real branch to every write. Fatal errors in
+  release crash shipped games over one bad value the peer would simply
+  have rejected. The writer sits inside the trust boundary; the reader
+  guards it. Release write correctness is the programmer's responsibility;
+  the library's contributions are the ones that are free at runtime —
+  debug asserts at the exact line, and the schema's compile time
+  constraints. Consumer-profiled contracts (P2900, FUTURE.md) are the only
+  acceptable future refinement: enforcement bought by the user, never
+  imposed by the library.
 - **The serialize macros hide `return false` on purpose** — invalid packet
   data must abort the whole serialize function immediately. Serialize
   functions are `template <typename Stream>` returning bool. Do not propose
