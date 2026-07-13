@@ -193,6 +193,12 @@ Measured on Apple Silicon (Apple clang, Release, medians of interleaved runs) ag
 | bitpacker read (random widths) | 3,652 MB/s | 3,648 MB/s |
 | stream write | 44.3 M packets/s | ~64 M packets/s |
 | stream read | ~135 M packets/s | ~120 M packets/s |
+| schema write | — | ~520 M packets/s |
+| schema read | — | ~430 M packets/s |
+
+The schema rows are the same benchmark packet serialized through the compile time schema path
+(bench.cpp verifies the bytes are identical to the stream path before timing): roughly 8x the
+stream writes and 3.5x the stream reads, with no classic equivalent to compare against.
 
 The raw bitpacker is at parity — the classic 64 bit scratch, qword flush writer was measured against a fully branchless store-per-write design and kept, because it won on every benchmark. Stream writes are ~45% faster (force-inlined hot core plus an inline fast path for small byte copies). Stream reads compile to instruction-identical code; the residual difference in the table is benchmark code/data placement sensitivity, not the serializer (the same binaries swing ±15% with 8 byte layout perturbations).
 

@@ -20,7 +20,7 @@ add_library(serialize INTERFACE)
 add_library(serialize::serialize ALIAS serialize)
 # serialize.modern requires C++23: <bit>, std::bit_cast, std::byteswap, std::endian, if constexpr macros
 target_compile_features(serialize INTERFACE cxx_std_23)
-target_include_directories(serialize INTERFACE
+target_include_directories(serialize SYSTEM INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )

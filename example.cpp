@@ -385,11 +385,69 @@ struct Packet
     }
 };
 
+// ------------------------------------------------------------------------------------------
+
+// compile time schemas: describe the packet as a type and the library generates constant-offset
+// serialization code -- no runtime bit cursor, ~3x faster reads and ~7x faster writes than the
+// stream path, byte-identical on the wire. see SCHEMA.md for the full language.
+
+struct Telemetry
+{
+    uint32_t sequence;
+    bool hasPosition;
+    float x, y, z;
+    uint32_t health;
+};
+
+using TelemetrySchema = serialize::schema<
+    serialize::bits<&Telemetry::sequence, 16>,
+    serialize::branch<&Telemetry::hasPosition,                      // if true do this, else do that -- at compile time
+        serialize::fields<
+            serialize::float_<&Telemetry::x>,
+            serialize::float_<&Telemetry::y>,
+            serialize::float_<&Telemetry::z> >,
+        serialize::fields<> >,
+    serialize::int_<&Telemetry::health, 0, 100> >;
+
+void schema_example()
+{
+    Telemetry input;
+    memset( (void*) &input, 0, sizeof(input) );
+    input.sequence = 12345;
+    input.hasPosition = true;
+    input.x = 10.0f;
+    input.y = 20.0f;
+    input.z = 30.0f;
+    input.health = 100;
+
+    uint8_t buffer[TelemetrySchema::MaxBytes + 8];                  // + 8: buffer allocations extend 8 bytes past the end
+
+    const int64_t bytesWritten = TelemetrySchema::Write( buffer, TelemetrySchema::MaxBytes, input );
+
+    Telemetry output;
+    memset( (void*) &output, 0, sizeof(output) );
+    if ( !TelemetrySchema::Read( buffer, bytesWritten, output ) )   // validates and rejects malformed packets, like ReadStream
+    {
+        printf( "error: schema read failed\n" );
+        exit( 1 );
+    }
+
+    if ( output.sequence != input.sequence || output.x != input.x || output.health != input.health )
+    {
+        printf( "error: schema packet read back does not match packet written\n" );
+        exit( 1 );
+    }
+
+    printf( "schema: wrote %d bytes, read them back and validated\n\n", (int) bytesWritten );
+}
+
 #include <time.h>
 
 int main()
 {
     printf( "\nserialize example\n\n" );
+
+    schema_example();
 
     srand( time(NULL) );
 

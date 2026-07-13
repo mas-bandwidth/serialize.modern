@@ -207,7 +207,9 @@ instantiates many schemas full of forking constructs pays proportionally. Measur
 worst case: one maximal `array_n` (17 paths) compiles in 0.2s to ~4 KB of code; two chained (289
 paths) in ~2s to ~60 KB; three chained (4,913 paths) in over a minute to more than a megabyte.
 Chaining two large forking constructs is the practical ceiling — past that, move the collection to
-the streams.
+the streams. Flat width has a ceiling too: the offset computation recurses once per flattened
+field, so schemas beyond ~500 fields hit default compiler constexpr depth limits (raise
+`-fconstexpr-depth` if you genuinely need more; 300 fields compile in under a second).
 
 ## What stays on the streams
 

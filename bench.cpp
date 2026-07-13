@@ -373,6 +373,117 @@ void bench_stream()
 
 // ------------------------------------------------------------------------------------------
 
+// the schema twin of BenchPacket, wire-identical by construction (verified below before timing).
+// this makes the schema speedup claims reproducible by the shipped benchmark instead of resting
+// on development-time scratch harnesses.
+
+using BenchSchema = serialize::schema<
+    serialize::int_<&BenchPacket::a, -100, +100>,
+    serialize::int_<&BenchPacket::b, 0, 65535>,
+    serialize::int_<&BenchPacket::c, -1000000, +1000000>,
+    serialize::bits<&BenchPacket::bits7, 7>,
+    serialize::bits<&BenchPacket::bits13, 13>,
+    serialize::bits<&BenchPacket::bits23, 23>,
+    serialize::bool_<&BenchPacket::flag>,
+    serialize::float_<&BenchPacket::x>,
+    serialize::float_<&BenchPacket::y>,
+    serialize::float_<&BenchPacket::z>,
+    serialize::bits<&BenchPacket::big, 64>,
+    serialize::bytes<&BenchPacket::blob, 17> >;
+
+void bench_schema()
+{
+    const int PacketBufferSize = 256;
+
+    uint8_t * buffer = (uint8_t*) malloc( PacketBufferSize + 8 );           // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+    memset( buffer, 0, PacketBufferSize + 8 );
+
+    BenchPacket packet;
+    packet.Init();
+
+    uint8_t * variant_buffers[NumVariants];
+    int bytes_per_packet = 0;
+    {
+        uint64_t rng = 1;
+        for ( int k = 0; k < NumVariants; k++ )
+        {
+            variant_buffers[k] = (uint8_t*) malloc( PacketBufferSize + 8 );
+            memset( variant_buffers[k], 0, PacketBufferSize + 8 );
+            rng = bench_vary_packet( packet, rng );
+            bytes_per_packet = (int) BenchSchema::Write( variant_buffers[k], PacketBufferSize, packet );
+
+            // wire identity vs the stream path, before timing anything
+            serialize::WriteStream stream( buffer, PacketBufferSize );
+            if ( !packet.Serialize( stream ) )
+                exit( 1 );
+            stream.Flush();
+            if ( bytes_per_packet != stream.GetBytesProcessed()
+              || memcmp( variant_buffers[k], buffer, (size_t) bytes_per_packet ) != 0 )
+            {
+                printf( "schema bench: wire mismatch vs stream path!\n" );
+                exit( 1 );
+            }
+        }
+    }
+
+    double best_write = 1e30;
+    double best_read = 1e30;
+    double best_measure = 1e30;
+
+    for ( int trial = 0; trial < NumTrials; trial++ )
+    {
+        uint64_t rng = 1;
+
+        double start = time_now();
+        for ( int i = 0; i < StreamNumPackets; i++ )
+        {
+            rng = bench_vary_packet( packet, rng );
+            const int64_t written = BenchSchema::Write( buffer, PacketBufferSize, packet );
+            bench_escape( buffer );
+            g_sink = g_sink + (uint64_t) written;
+        }
+        double time = time_now() - start;
+        if ( time < best_write )
+            best_write = time;
+
+        start = time_now();
+        for ( int i = 0; i < StreamNumPackets; i++ )
+        {
+            BenchPacket read_packet;
+            if ( !BenchSchema::Read( variant_buffers[i & ( NumVariants - 1 )], bytes_per_packet, read_packet ) )
+                exit( 1 );
+            bench_escape( &read_packet );               // every decoded field is observed, so the full decode must happen
+            g_sink = g_sink + (uint64_t) read_packet.b;
+        }
+        time = time_now() - start;
+        if ( time < best_read )
+            best_read = time;
+
+        start = time_now();
+        for ( int i = 0; i < StreamNumPackets; i++ )
+        {
+            rng = bench_vary_packet( packet, rng );
+            g_sink = g_sink + (uint64_t) BenchSchema::MeasureBits( packet );
+        }
+        time = time_now() - start;
+        if ( time < best_measure )
+            best_measure = time;
+    }
+
+    const double total_mb = double( bytes_per_packet ) * StreamNumPackets / ( 1024.0 * 1024.0 );
+    const double packets = double( StreamNumPackets ) / 1000000.0;
+
+    printf( "schema write:     %8.1f MB/s  (%.1f M packets/s)\n", total_mb / best_write, packets / best_write );
+    printf( "schema read:      %8.1f MB/s  (%.1f M packets/s)\n", total_mb / best_read, packets / best_read );
+    printf( "schema measure:   %19.1f M packets/s\n", packets / best_measure );
+
+    for ( int k = 0; k < NumVariants; k++ )
+        free( variant_buffers[k] );
+    free( buffer );
+}
+
+// ------------------------------------------------------------------------------------------
+
 int main()
 {
     printf( "\n[serialize benchmark]\n\n" );
@@ -388,6 +499,8 @@ int main()
     bench_bitpacker_random( buffer );
 
     bench_stream();
+
+    bench_schema();
 
     free( buffer );
 
