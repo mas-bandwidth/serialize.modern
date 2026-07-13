@@ -501,6 +501,191 @@ template <typename Stream> bool FuzzRoundTrip( Stream & stream, const uint8_t * 
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// schema coverage. the schema Read path is a large hostile-input parser in its own right, so it
+// gets the same two passes as the streams: hostile bytes must fail cleanly or decode to in-contract
+// values, and a differential round trip against a stream twin must be byte identical.
+
+struct FuzzElement
+{
+    uint32_t value;
+};
+
+using FuzzElementSchema = serialize::schema< serialize::bits<&FuzzElement::value, 9> >;
+
+struct FuzzSchemaPacket
+{
+    uint32_t style;
+    bool extended;
+    float charge;
+    uint32_t bonus;
+    int32_t base;
+    int32_t next;
+    char name[9];
+    uint8_t blob[5];
+    int32_t blob_count;
+    FuzzElement rings[4];
+    int32_t ring_count;
+    uint32_t tail;
+};
+
+// one of everything the schema runner does: constants, back references, matches, relative ints,
+// runtime-length sections, a bounded counted array with a nonzero minimum, and reserved bits
+using FuzzSchema = serialize::schema<
+    serialize::const_<0x5AF3, 16>,
+    serialize::bits<&FuzzSchemaPacket::style, 2>,
+    serialize::bool_<&FuzzSchemaPacket::extended>,
+    serialize::branch_on<&FuzzSchemaPacket::extended,
+        serialize::fields< serialize::float_<&FuzzSchemaPacket::charge> >,
+        serialize::fields<> >,
+    serialize::match<&FuzzSchemaPacket::style,
+        serialize::case_<1, serialize::bits<&FuzzSchemaPacket::bonus, 8>>>,
+    serialize::int_<&FuzzSchemaPacket::base, 0, 500>,
+    serialize::int_relative_<&FuzzSchemaPacket::base, &FuzzSchemaPacket::next>,
+    serialize::string<&FuzzSchemaPacket::name>,
+    serialize::bytes_n<&FuzzSchemaPacket::blob, &FuzzSchemaPacket::blob_count>,
+    serialize::array_n<&FuzzSchemaPacket::rings, &FuzzSchemaPacket::ring_count, FuzzElementSchema, 1, 3>,
+    serialize::reserved_<3>,
+    serialize::bits<&FuzzSchemaPacket::tail, 12> >;
+
+// the stream twin: must be byte identical to FuzzSchema, field for field
+template <typename Stream> bool FuzzSchemaTwin( Stream & stream, FuzzSchemaPacket & p )
+{
+    uint32_t magic = 0x5AF3;
+    serialize_bits( stream, magic, 16 );
+    if ( Stream::IsReading && magic != 0x5AF3 )
+        return false;
+    serialize_bits( stream, p.style, 2 );
+    serialize_bool( stream, p.extended );
+    if ( p.extended )
+    {
+        serialize_float( stream, p.charge );
+    }
+    switch ( p.style )
+    {
+        case 1: serialize_bits( stream, p.bonus, 8 ); break;
+        default: break;
+    }
+    serialize_int( stream, p.base, 0, 500 );
+    serialize_int_relative( stream, p.base, p.next );
+    serialize_string( stream, p.name, (int) sizeof( p.name ) );
+    serialize_int( stream, p.blob_count, 0, 5 );
+    serialize_bytes( stream, p.blob, p.blob_count );
+    serialize_int( stream, p.ring_count, 1, 3 );
+    for ( int i = 0; i < p.ring_count; i++ )
+        serialize_bits( stream, p.rings[i].value, 9 );
+    uint32_t reserved = 0;
+    serialize_bits( stream, reserved, 3 );
+    if ( Stream::IsReading && reserved != 0 )
+        return false;
+    serialize_bits( stream, p.tail, 12 );
+    return true;
+}
+
+inline bool FuzzSchemaPacketsEqual( const FuzzSchemaPacket & a, const FuzzSchemaPacket & b )
+{
+    if ( a.style != b.style || a.extended != b.extended || a.base != b.base || a.next != b.next )
+        return false;
+    if ( a.extended && memcmp( &a.charge, &b.charge, 4 ) != 0 )     // bit compare: charge may be any 32 bits, including NaN
+        return false;
+    if ( a.style == 1 && a.bonus != b.bonus )
+        return false;
+    if ( strcmp( a.name, b.name ) != 0 )
+        return false;
+    if ( a.blob_count != b.blob_count || memcmp( a.blob, b.blob, (size_t) a.blob_count ) != 0 )
+        return false;
+    if ( a.ring_count != b.ring_count )
+        return false;
+    for ( int i = 0; i < a.ring_count; i++ )
+    {
+        if ( a.rings[i].value != b.rings[i].value )
+            return false;
+    }
+    return a.tail == b.tail;
+}
+
+// pass 1: hostile bytes. reads must fail cleanly or produce in-contract values, and a successful
+// decode must survive a write/read round trip with identical fields and an exact measure.
+inline void FuzzSchemaHostile( const uint8_t * buffer, int64_t bytes )
+{
+    FuzzSchemaPacket p;
+    memset( (void*) &p, 0, sizeof( p ) );
+    if ( !FuzzSchema::Read( buffer, bytes, p ) )
+        return;
+
+    fuzz_check( p.style <= 3 );
+    fuzz_check( p.base >= 0 && p.base <= 500 );
+    fuzz_check( p.next > p.base );
+    fuzz_check( strlen( p.name ) < sizeof( p.name ) );
+    fuzz_check( p.blob_count >= 0 && p.blob_count <= 5 );
+    fuzz_check( p.ring_count >= 1 && p.ring_count <= 3 );
+    for ( int i = 0; i < p.ring_count; i++ )
+        fuzz_check( p.rings[i].value < 512 );
+    fuzz_check( p.tail < 4096 );
+
+    uint8_t reencoded[FuzzSchema::MaxBytes + 8];
+    memset( reencoded, 0, sizeof( reencoded ) );
+    const int64_t written = FuzzSchema::Write( reencoded, FuzzSchema::MaxBytes, p );
+    fuzz_check( written == FuzzSchema::MeasureBytes( p ) );
+
+    FuzzSchemaPacket q;
+    memset( (void*) &q, 0, sizeof( q ) );
+    fuzz_check( FuzzSchema::Read( reencoded, written, q ) == true );
+    fuzz_check( FuzzSchemaPacketsEqual( p, q ) );
+}
+
+// pass 2: differential round trip. in-range values from the pool go through the schema writer and
+// the stream twin: the bytes must be identical, the measure exact, and both readers must agree.
+inline void FuzzSchemaDifferential( ValuePool & pool )
+{
+    FuzzSchemaPacket p;
+    memset( (void*) &p, 0, sizeof( p ) );
+    p.style = pool.NextByte() & 3;
+    p.extended = ( pool.NextByte() & 1 ) != 0;
+    const uint32_t charge_bits = pool.NextUint32();
+    memcpy( &p.charge, &charge_bits, 4 );
+    p.bonus = pool.NextByte();
+    p.base = int32_t( pool.NextUint32() % 501 );
+    static const uint32_t bucket_diffs[8] = { 1, 3, 20, 200, 4000, 60000, 1000000, 5 };
+    p.next = int32_t( uint32_t( p.base ) + bucket_diffs[pool.NextByte() & 7] );
+    const int name_length = int( pool.NextByte() % 9 );
+    for ( int i = 0; i < name_length; i++ )
+        p.name[i] = char( 'a' + pool.NextByte() % 26 );
+    p.name[name_length] = '\0';
+    p.blob_count = int( pool.NextByte() % 6 );
+    for ( int i = 0; i < p.blob_count; i++ )
+        p.blob[i] = pool.NextByte();
+    p.ring_count = 1 + int( pool.NextByte() % 3 );
+    for ( int i = 0; i < p.ring_count; i++ )
+        p.rings[i].value = pool.NextUint32() & 511;
+    p.tail = pool.NextUint32() & 4095;
+
+    uint8_t schema_buffer[FuzzSchema::MaxBytes + 8];
+    memset( schema_buffer, 0, sizeof( schema_buffer ) );
+    const int64_t schema_bytes = FuzzSchema::Write( schema_buffer, FuzzSchema::MaxBytes, p );
+    fuzz_check( schema_bytes == FuzzSchema::MeasureBytes( p ) );
+
+    uint8_t twin_buffer[64 + 8];
+    memset( twin_buffer, 0, sizeof( twin_buffer ) );
+    serialize::WriteStream twinStream( twin_buffer, 64 );
+    fuzz_check( FuzzSchemaTwin( twinStream, p ) == true );
+    twinStream.Flush();
+    fuzz_check( twinStream.GetBytesProcessed() == schema_bytes );
+    fuzz_check( memcmp( twin_buffer, schema_buffer, (size_t) schema_bytes ) == 0 );
+    fuzz_check( FuzzSchema::MeasureBits( p ) == twinStream.GetBitsProcessed() );
+
+    FuzzSchemaPacket out;
+    memset( (void*) &out, 0, sizeof( out ) );
+    fuzz_check( FuzzSchema::Read( twin_buffer, schema_bytes, out ) == true );
+    fuzz_check( FuzzSchemaPacketsEqual( p, out ) );
+
+    FuzzSchemaPacket out2;
+    memset( (void*) &out2, 0, sizeof( out2 ) );
+    serialize::ReadStream twinRead( schema_buffer, schema_bytes );
+    fuzz_check( FuzzSchemaTwin( twinRead, out2 ) == true );
+    fuzz_check( FuzzSchemaPacketsEqual( p, out2 ) );
+}
+
 extern "C" int LLVMFuzzerTestOneInput( const uint8_t * data, size_t size )
 {
     const int NumOps = 32;
@@ -547,6 +732,19 @@ extern "C" int LLVMFuzzerTestOneInput( const uint8_t * data, size_t size )
         serialize::ReadStream readStream( writeBuffer, writeStream.GetBytesProcessed() );
         ValuePool readPool( payload, payloadBytes );
         fuzz_check( FuzzRoundTrip( readStream, ops, NumOps, readPool ) == true );               // reading back our own data must always succeed
+    }
+
+    // pass 3: schema hostile read of the same arbitrary bytes
+    {
+        std::vector<uint8_t> buffer( payloadBytes + 8, 0 );
+        memcpy( buffer.data(), payload, payloadBytes );
+        FuzzSchemaHostile( buffer.data(), (int64_t) payloadBytes );
+    }
+
+    // pass 4: schema differential round trip against the stream twin
+    {
+        ValuePool schemaPool( payload, payloadBytes );
+        FuzzSchemaDifferential( schemaPool );
     }
 
     return 0;

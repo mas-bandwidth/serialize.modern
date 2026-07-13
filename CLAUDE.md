@@ -89,8 +89,11 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
   point) and both cross-reads. A negative test (one flipped bit) fails both
   readers, so the gate can actually fail.
 - The golden wire format test passes with classic's exact golden bytes.
-- The fuzz harness compiles but cannot run locally (Apple clang ships no
-  libFuzzer); it relies on the CI fuzz job and nightly-fuzz workflow.
+- The fuzz harness covers the streams AND the schema path (hostile schema
+  reads with invariant checks plus a schema-vs-stream differential that
+  requires byte-identical wire). libFuzzer cannot run locally (Apple clang
+  ships none), but a 300k-iteration random driver under ASan+UBSan runs
+  clean locally; CI runs the real fuzzer 60s per push and nightly.
 
 ### Performance engineering record
 
