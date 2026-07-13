@@ -53,11 +53,12 @@
       multiple-of-8 buffer size requirement for writes is gone: any buffer size works, as long as the
       allocation extends 8 bytes past it.
 
-    - Compile time schemas (serialize::schema) describe fixed-layout packets as types: every field
-      offset, shift and mask folds to a constant, reads become independent window loads and writes
-      become ORs into registers. Measured ~3x faster reads and up to ~7x faster writes than the
-      stream path, byte-identical on the wire. Schemas support compile time if/else (branch)
-      and compose like serialize_object (object). See the schema section below.
+    - Compile time schemas (serialize::schema) describe packets as types: every field offset,
+      shift and mask folds to a constant, reads become independent window loads and writes become
+      ORs into registers. Measured ~3x faster reads and up to ~7x faster writes than the stream
+      path, byte-identical on the wire. Schemas support compile time if/else and switch (branch,
+      branch_on, match), loops (array, array_n), runtime-length sections (string, bytes_n), and
+      compose like serialize_object (object). See the schema section below.
 
     - The hot bitpack core is explicitly force-inlined. The 64 bit paths are big enough that compilers
       otherwise leave them out of line, and a function call in the middle of packet decode costs
@@ -1400,7 +1401,8 @@ namespace serialize
         constant offsets and branch specialization pass through composition unchanged.
 
         Wire format: identical to the equivalent serialize_* calls, field for field (bytes
-        aligns first, exactly like serialize_bytes; object is exactly serialize_object).
+        aligns first, exactly like serialize_bytes; object is exactly serialize_object). The
+        single exception is wstring_, which aligns before its code points; see its documentation.
         Validation is preserved: reads bounds-check each path segment, range-check ranged integers
         and reject nonzero alignment padding. Writes follow the trust model: debug asserts,
         unchecked in release.
@@ -1429,8 +1431,9 @@ namespace serialize
      */
 
     /// How the schema runner treats a field: an inline bitpacked value, an aligned byte block, a
-    /// conditional branch, a bounded count with one specialized path per value, or a runtime-length
-    /// section after which the schema continues at a runtime byte offset.
+    /// conditional branch (serialized or back referenced), a switch on an earlier member, a bounded
+    /// count with one specialized path per value, a runtime-length section after which the schema
+    /// continues at a runtime byte offset, or a relative integer with one path per bucket.
     enum class field_kind { leaf, bytes, branch, branch_on, match, counted, dynamic, relative };
 
     namespace schema_detail
@@ -2051,6 +2054,12 @@ namespace serialize
 
         static consteval int64_t leg_total_bits( int leg ) { return leg_header_bits( leg ) + leg_payload_bits( leg ); }
 
+        static serialize_force_inline int leg_for_difference( uint32_t difference ) noexcept
+        {
+            return ( difference == 1 ) ? 0 : ( difference <= 6 ) ? 1 : ( difference <= 23 ) ? 2
+                 : ( difference <= 280 ) ? 3 : ( difference <= 4377 ) ? 4 : ( difference <= 69914 ) ? 5 : 6;
+        }
+
         static consteval int64_t bits_at( int64_t ) { return leg_total_bits( 6 ); }         // the widest leg
 
         static serialize_force_inline uint32_t get_prev( const object_type & object ) noexcept { return uint32_t( object.*PrevMember ); }
@@ -2160,12 +2169,38 @@ namespace serialize
             static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept { F::write_content( object.*Outer, content, length ); }
         };
 
+        template <auto Outer, typename F> struct nest<Outer, F, field_kind::relative>
+        {
+            using object_type = typename member_traits<decltype(Outer)>::object_type;
+
+            static constexpr field_kind kind = field_kind::relative;
+            using writes = typename paths_prepend<typename F::writes, Outer>::type;
+            using referenced = typename path_prepend<typename F::referenced, Outer>::type;
+            static constexpr int num_legs = F::num_legs;
+
+            static consteval int64_t leg_header_bits( int leg ) { return F::leg_header_bits( leg ); }
+            static consteval uint64_t leg_header_value( int leg ) { return F::leg_header_value( leg ); }
+            static consteval int leg_payload_bits( int leg ) { return F::leg_payload_bits( leg ); }
+            static consteval uint32_t leg_min( int leg ) { return F::leg_min( leg ); }
+            static consteval uint32_t leg_max( int leg ) { return F::leg_max( leg ); }
+            static consteval int64_t leg_total_bits( int leg ) { return F::leg_total_bits( leg ); }
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            static serialize_force_inline uint32_t get_prev( const object_type & object ) noexcept { return F::get_prev( object.*Outer ); }
+            static serialize_force_inline uint32_t get_curr( const object_type & object ) noexcept { return F::get_curr( object.*Outer ); }
+            static serialize_force_inline void set_curr( object_type & object, uint32_t value ) noexcept { F::set_curr( object.*Outer, value ); }
+            static serialize_force_inline bool curr_greater_prev( const object_type & object ) noexcept { return F::curr_greater_prev( object.*Outer ); }
+            static serialize_force_inline bool curr_valid_for_write( const object_type & object ) noexcept { return F::curr_valid_for_write( object.*Outer ); }
+            static serialize_force_inline int leg_for_difference( uint32_t difference ) noexcept { return F::leg_for_difference( difference ); }
+        };
+
         template <auto Outer, typename F> struct nest<Outer, F, field_kind::counted>
         {
             using object_type = typename member_traits<decltype(Outer)>::object_type;
 
             static constexpr field_kind kind = field_kind::counted;
             using writes = typename paths_prepend<typename F::writes, Outer>::type;
+            static constexpr int64_t min_count = F::min_count;
             static constexpr int64_t max_count = F::max_count;
             static constexpr int count_bits = F::count_bits;
 
@@ -2274,6 +2309,84 @@ namespace serialize
             static serialize_force_inline int64_t length_for_write( const object_type & object ) noexcept { return F::length_for_write( ( object.*Member )[Index] ); }
             static serialize_force_inline bool read_content( object_type & object, const uint8_t * content, int64_t length ) noexcept { return F::read_content( ( object.*Member )[Index], content, length ); }
             static serialize_force_inline void write_content( const object_type & object, uint8_t * content, int64_t length ) noexcept { F::write_content( ( object.*Member )[Index], content, length ); }
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::branch_on>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+            using then_list = wrap_at_t<Member, Index, typename F::then_list>;
+            using else_list = wrap_at_t<Member, Index, typename F::else_list>;
+
+            static constexpr field_kind kind = field_kind::branch_on;
+            using writes = path_list<>;
+            using referenced = typename path_prepend<typename F::referenced, Member, Index>::type;
+
+            static consteval int64_t bits_at( int64_t ) { return 0; }
+
+            static serialize_force_inline bool get( const object_type & object ) noexcept { return F::get( ( object.*Member )[Index] ); }
+        };
+
+        template <auto Member, int64_t Index, typename CasePack> struct wrap_cases_at;
+        template <auto Member, int64_t Index, typename... Cs> struct wrap_cases_at<Member, Index, case_pack<Cs...>>
+        {
+            using type = case_pack<typename case_from_list<Cs::value, wrap_at_t<Member, Index, typename Cs::list>>::type...>;
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::match>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+            using cases = typename wrap_cases_at<Member, Index, typename F::cases>::type;
+
+            static constexpr field_kind kind = field_kind::match;
+            using writes = path_list<>;
+            using referenced = typename path_prepend<typename F::referenced, Member, Index>::type;
+
+            static consteval int64_t bits_at( int64_t ) { return 0; }
+
+            static serialize_force_inline int64_t get( const object_type & object ) noexcept { return F::get( ( object.*Member )[Index] ); }
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::counted>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+
+            static constexpr field_kind kind = field_kind::counted;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
+            static constexpr int64_t min_count = F::min_count;
+            static constexpr int64_t max_count = F::max_count;
+            static constexpr int count_bits = F::count_bits;
+
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            template <int64_t I> using elements = wrap_at_t<Member, Index, typename F::template elements<I>>;
+
+            static serialize_force_inline int64_t get_count( const object_type & object ) noexcept { return F::get_count( ( object.*Member )[Index] ); }
+            static serialize_force_inline void set_count( object_type & object, int64_t count ) noexcept { F::set_count( ( object.*Member )[Index], count ); }
+        };
+
+        template <auto Member, int64_t Index, typename F> struct nest_at<Member, Index, F, field_kind::relative>
+        {
+            using object_type = typename member_traits<decltype(Member)>::object_type;
+
+            static constexpr field_kind kind = field_kind::relative;
+            using writes = typename paths_prepend<typename F::writes, Member, Index>::type;
+            using referenced = typename path_prepend<typename F::referenced, Member, Index>::type;
+            static constexpr int num_legs = F::num_legs;
+
+            static consteval int64_t leg_header_bits( int leg ) { return F::leg_header_bits( leg ); }
+            static consteval uint64_t leg_header_value( int leg ) { return F::leg_header_value( leg ); }
+            static consteval int leg_payload_bits( int leg ) { return F::leg_payload_bits( leg ); }
+            static consteval uint32_t leg_min( int leg ) { return F::leg_min( leg ); }
+            static consteval uint32_t leg_max( int leg ) { return F::leg_max( leg ); }
+            static consteval int64_t leg_total_bits( int leg ) { return F::leg_total_bits( leg ); }
+            static consteval int64_t bits_at( int64_t K ) { return F::bits_at( K ); }
+
+            static serialize_force_inline uint32_t get_prev( const object_type & object ) noexcept { return F::get_prev( ( object.*Member )[Index] ); }
+            static serialize_force_inline uint32_t get_curr( const object_type & object ) noexcept { return F::get_curr( ( object.*Member )[Index] ); }
+            static serialize_force_inline void set_curr( object_type & object, uint32_t value ) noexcept { F::set_curr( ( object.*Member )[Index], value ); }
+            static serialize_force_inline bool curr_greater_prev( const object_type & object ) noexcept { return F::curr_greater_prev( ( object.*Member )[Index] ); }
+            static serialize_force_inline bool curr_valid_for_write( const object_type & object ) noexcept { return F::curr_valid_for_write( ( object.*Member )[Index] ); }
+            static serialize_force_inline int leg_for_difference( uint32_t difference ) noexcept { return F::leg_for_difference( difference ); }
         };
 
         // one element of an unsigned integral array, Bits wide: the leaf bits_array expands into
@@ -2729,9 +2842,7 @@ namespace serialize
                 else if constexpr ( F::kind == field_kind::relative )
                 {
                     const uint32_t difference = F::get_curr( object ) - F::get_prev( object );
-                    const int leg = ( difference == 1 ) ? 0 : ( difference <= 6 ) ? 1 : ( difference <= 23 ) ? 2
-                                  : ( difference <= 280 ) ? 3 : ( difference <= 4377 ) ? 4 : ( difference <= 69914 ) ? 5 : 6;
-                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::measure( leg, object );
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::measure( F::leg_for_difference( difference ), object );
                 }
                 else
                 {
@@ -2886,9 +2997,7 @@ namespace serialize
                 {
                     serialize_assert( F::curr_valid_for_write( object ) );
                     const uint32_t difference = F::get_curr( object ) - F::get_prev( object );
-                    const int leg = ( difference == 1 ) ? 0 : ( difference <= 6 ) ? 1 : ( difference <= 23 ) ? 2
-                                  : ( difference <= 280 ) ? 3 : ( difference <= 4377 ) ? 4 : ( difference <= 69914 ) ? 5 : 6;
-                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::write( data, words, leg, difference, object );
+                    return relative_dispatch<T, SegBase, K, F, 0, Rest...>::write( data, words, F::leg_for_difference( difference ), difference, object );
                 }
                 else if constexpr ( F::kind == field_kind::dynamic )
                 {
@@ -3228,7 +3337,9 @@ namespace serialize
 
     /**
         A compile time packet schema: a list of fields serialized in order with constant offsets.
-        @see bits, int_, int64, bool_, float_, double_, align, bytes, branch, object
+        @see bits, int_, int64, bool_, float_, double_, align, bytes, const_, reserved_, enum_,
+        @see compressed_float_, branch, branch_on, match, object, array, bits_array, array_n,
+        @see string, bytes_n, wstring_, int_relative_
      */
     /**
         True if every branch_on and match in the field list references a member path serialized
@@ -3246,7 +3357,8 @@ namespace serialize
         static_assert( valid_references<FirstField, RestFields...>,
                        "branch_on/match must reference a member serialized unconditionally EARLIER in the schema: back references only, never forward references" );
 
-        /// The flattened field list: object fields spliced in place, only leaf/bytes/branch fields remain.
+        /// The flattened field list: object and array fields spliced in place with composed accessors,
+        /// leaving only fields the runner executes directly.
         using field_list = schema_detail::flatten_t<fields<FirstField, RestFields...>>;
 
         using object_type = typename schema_detail::first_object_type<field_list>::type;
@@ -5861,6 +5973,160 @@ inline void test_schema_array_n_bounds()
     }
 }
 
+// every field kind must compose through object and through fixed array elements: back references
+// and matches inside array elements, and relative ints and bounded counted arrays inside objects.
+
+struct SchemaGadget
+{
+    bool powered;
+    float charge;
+    uint32_t style;
+    uint32_t bonus;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_bool( stream, powered );
+        if ( powered )
+        {
+            serialize_float( stream, charge );
+        }
+        serialize_bits( stream, style, 2 );
+        switch ( style )
+        {
+            case 1: serialize_bits( stream, bonus, 8 ); break;
+            default: break;
+        }
+        return true;
+    }
+};
+
+using SchemaGadgetSchema = serialize::schema<
+    serialize::bool_<&SchemaGadget::powered>,
+    serialize::branch_on<&SchemaGadget::powered,
+        serialize::fields< serialize::float_<&SchemaGadget::charge> >,
+        serialize::fields<> >,
+    serialize::bits<&SchemaGadget::style, 2>,
+    serialize::match<&SchemaGadget::style,
+        serialize::case_<1, serialize::bits<&SchemaGadget::bonus, 8>>> >;
+
+struct SchemaProgress
+{
+    int32_t start;
+    int32_t finish;
+    SchemaVec marks[6];
+    int32_t mark_count;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        serialize_int( stream, start, 0, 1000 );
+        serialize_int_relative( stream, start, finish );
+        serialize_int( stream, mark_count, 1, 3 );
+        for ( int i = 0; i < mark_count; i++ )
+            serialize_object( stream, marks[i] );
+        return true;
+    }
+};
+
+using SchemaProgressSchema = serialize::schema<
+    serialize::int_<&SchemaProgress::start, 0, 1000>,
+    serialize::int_relative_<&SchemaProgress::start, &SchemaProgress::finish>,
+    serialize::array_n<&SchemaProgress::marks, &SchemaProgress::mark_count, SchemaVecSchema, 1, 3> >;
+
+struct SchemaMissionPacket
+{
+    SchemaGadget gadgets[2];
+    SchemaProgress progress;
+    uint32_t tail;
+
+    template <typename Stream> bool Serialize( Stream & stream )
+    {
+        for ( int i = 0; i < 2; i++ )
+            serialize_object( stream, gadgets[i] );
+        serialize_object( stream, progress );
+        serialize_bits( stream, tail, 12 );
+        return true;
+    }
+};
+
+using SchemaMissionSchema = serialize::schema<
+    serialize::array<&SchemaMissionPacket::gadgets, SchemaGadgetSchema>,
+    serialize::object<&SchemaMissionPacket::progress, SchemaProgressSchema>,
+    serialize::bits<&SchemaMissionPacket::tail, 12> >;
+
+// worst case gadget is 1+32+2+8 = 43 bits; worst progress is 10 + 38 (relative fallback) + 2 + 3*96
+static_assert( SchemaMissionSchema::MaxBits == 2 * 43 + ( 10 + 38 + 2 + 3 * 96 ) + 12 );
+
+inline void test_schema_composed()
+{
+    const int relative_diffs[4] = { 1, 20, 4000, 1000000 };
+
+    for ( int variant = 0; variant < 4; variant++ )
+    {
+        SchemaMissionPacket packet;
+        memset( (void*) &packet, 0, sizeof( packet ) );
+        packet.gadgets[0].powered = ( variant & 1 ) != 0;
+        packet.gadgets[0].charge = 42.5f;
+        packet.gadgets[0].style = uint32_t( variant & 3 );
+        packet.gadgets[0].bonus = 0xAB;
+        packet.gadgets[1].powered = ( variant & 2 ) != 0;
+        packet.gadgets[1].charge = -7.25f;
+        packet.gadgets[1].style = uint32_t( 3 - variant );
+        packet.gadgets[1].bonus = 0xCD;
+        packet.progress.start = 100;
+        packet.progress.finish = packet.progress.start + relative_diffs[variant];
+        packet.progress.mark_count = 1 + variant % 3;
+        for ( int i = 0; i < packet.progress.mark_count; i++ )
+            packet.progress.marks[i].x = float( i + variant );
+        packet.tail = 0xBEE;
+
+        uint8_t macro_buffer[96 + 8] = { 0 };          // + 8: buffer allocations extend 8 bytes past the end, for the writer and the reader
+        serialize::WriteStream writeStream( macro_buffer, 96 );
+        serialize_check( packet.Serialize( writeStream ) == true );
+        writeStream.Flush();
+        const int64_t macroBytes = writeStream.GetBytesProcessed();
+
+        serialize_check( SchemaMissionSchema::MeasureBits( packet ) == writeStream.GetBitsProcessed() );
+
+        uint8_t schema_buffer[96 + 8] = { 0 };
+        const int64_t schemaBytes = SchemaMissionSchema::Write( schema_buffer, 96, packet );
+        serialize_check( schemaBytes == macroBytes );
+        serialize_check( memcmp( schema_buffer, macro_buffer, (size_t) macroBytes ) == 0 );
+
+        SchemaMissionPacket out;
+        memset( (void*) &out, 0, sizeof( out ) );
+        serialize_check( SchemaMissionSchema::Read( macro_buffer, macroBytes, out ) == true );
+        for ( int i = 0; i < 2; i++ )
+        {
+            serialize_check( out.gadgets[i].powered == packet.gadgets[i].powered );
+            if ( packet.gadgets[i].powered )
+                serialize_check( out.gadgets[i].charge == packet.gadgets[i].charge );
+            serialize_check( out.gadgets[i].style == packet.gadgets[i].style );
+            if ( packet.gadgets[i].style == 1 )
+                serialize_check( out.gadgets[i].bonus == packet.gadgets[i].bonus );
+        }
+        serialize_check( out.progress.start == packet.progress.start );
+        serialize_check( out.progress.finish == packet.progress.finish );
+        serialize_check( out.progress.mark_count == packet.progress.mark_count );
+        for ( int i = 0; i < packet.progress.mark_count; i++ )
+            serialize_check( out.progress.marks[i].x == packet.progress.marks[i].x );
+        serialize_check( out.tail == packet.tail );
+
+        SchemaMissionPacket out2;
+        memset( (void*) &out2, 0, sizeof( out2 ) );
+        serialize::ReadStream readStream( schema_buffer, schemaBytes );
+        serialize_check( out2.Serialize( readStream ) == true );
+        serialize_check( out2.tail == packet.tail );
+
+        // truncated packets must fail cleanly at every prefix length
+        for ( int64_t truncate = 0; truncate < macroBytes; truncate++ )
+        {
+            SchemaMissionPacket t;
+            memset( (void*) &t, 0, sizeof( t ) );
+            serialize_check( SchemaMissionSchema::Read( macro_buffer, truncate, t ) == false );
+        }
+    }
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -6121,6 +6387,7 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_relative );
         SERIALIZE_RUN_TEST( test_schema_nested_dynamic );
         SERIALIZE_RUN_TEST( test_schema_array_n_bounds );
+        SERIALIZE_RUN_TEST( test_schema_composed );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

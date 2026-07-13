@@ -10,8 +10,8 @@ design is actively solicited via GitHub issues.
 
 **serialize.modern** is the modern C++ (C++23) port of classic
 [serialize](https://github.com/mas-bandwidth/serialize), a single-header C++
-bitpacking serializer (~2,300 lines of library code in
-[serialize.h](serialize.h), plus ~1,100 lines of embedded tests) aimed at game
+bitpacking serializer (~4,000 lines of library code in
+[serialize.h](serialize.h), plus ~2,200 lines of embedded tests) aimed at game
 networking. The wire protocol is **byte-identical to classic serialize** —
 this is the repo's core invariant and is enforced two ways: the golden wire
 format test pins the exact bytes (same golden bytes as classic), and the
@@ -73,7 +73,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 27 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 28 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
@@ -135,7 +135,8 @@ best-of-5 runs, heap-buffered benchmark). Kept:
   static_asserts in test_schema_backref.
 - **Loops and variable length in schemas, three strategies, all measured.**
   array/bits_array unroll fixed counts at compile time. array_n (runtime
-  count, max <= 16) generates one fully constant path per possible count:
+  count in [min,max], range capped at 16) generates one fully constant path
+  per possible count, wire encoded relative to the minimum:
   pure specialization, no runtime cursor. string/bytes_n hand the rest of
   the schema off to a runtime byte base: shifts and masks stay constants,
   only the base pointer is a register, the length-bounded copy is the only
