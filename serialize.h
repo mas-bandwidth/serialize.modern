@@ -6562,6 +6562,34 @@ inline void test_schema_reject_parity()
     }
 }
 
+// the documented buffer slack contract, pinned: the writer may zero bytes in the 8 byte slack past
+// the written data but must never write a nonzero byte there, and must never touch memory beyond
+// data + bytes + 8. this is the contract that would break silently if the flush path changed.
+inline void test_buffer_slack_contract()
+{
+    uint8_t block[256];
+    memset( block, 0xFF, sizeof( block ) );
+
+    const int64_t size = 64;
+    serialize::WriteStream stream( block, size );
+    uint32_t value32 = 0xDEADBEEF;
+    uint32_t value7 = 0x55;
+    uint32_t value3 = 0x5;
+    uint8_t blob[9] = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    stream.SerializeBits( value32, 32 );
+    stream.SerializeBits( value7, 7 );
+    stream.SerializeBytes( blob, sizeof( blob ) );
+    stream.SerializeBits( value3, 3 );
+    stream.Flush();
+    const int64_t written = stream.GetBytesProcessed();
+    serialize_check( written > 0 );
+
+    for ( int64_t i = written; i < size + 8; i++ )
+        serialize_check( block[i] == 0xFF || block[i] == 0x00 );
+    for ( int64_t i = size + 8; i < (int64_t) sizeof( block ); i++ )
+        serialize_check( block[i] == 0xFF );
+}
+
 // Golden wire format test. The exact bytes produced by the serializer are pinned down here and must never change.
 // If this test fails, the wire format has changed and previously written data no longer decodes: a breaking change.
 // These are the same golden bytes as classic serialize: passing this test proves the modern port is wire compatible.
@@ -6824,6 +6852,7 @@ inline void serialize_test()
         SERIALIZE_RUN_TEST( test_schema_array_n_bounds );
         SERIALIZE_RUN_TEST( test_schema_composed );
         SERIALIZE_RUN_TEST( test_schema_reject_parity );
+        SERIALIZE_RUN_TEST( test_buffer_slack_contract );
         SERIALIZE_RUN_TEST( test_bits_required );
         SERIALIZE_RUN_TEST( test_bits_required64 );
         SERIALIZE_RUN_TEST( test_zigzag );

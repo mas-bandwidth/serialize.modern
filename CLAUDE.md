@@ -78,7 +78,7 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
 
 ### Verified state (July 2026)
 
-- All 29 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+- All 30 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
   Silicon (Apple clang 21). CI is green on every job: Debug/Release on
   Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
   on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
@@ -281,6 +281,41 @@ Fifth red/blue round (July 2026, runtime contracts and gate blind spots):
   compatibility the macro restoration exists to provide. Deliberate
   two-tier design: the macros are classic's surface verbatim; static
   safety lives in the schema. Do not re-propose macro static_asserts.
+
+Extended red/blue campaign, rounds 6-19 (July 2026). The owner asked for
+rounds until diminishing returns was definitely reached, plus ten more.
+The point was declared after round 9 (rounds 8 and 9 produced no library
+defect); rounds 10-19 were the mandated overtime. Compact record:
+
+- R6 (accepted): bench.cpp had NO schema benchmark and example.cpp no
+  schema example — the flagship numbers rested on scratch harnesses.
+  Both added; bench verifies wire identity vs the stream path before
+  timing and reproduces 524 M pkt/s write (7.8x) / 426 M read (3.5x);
+  README table updated. Re-baseline: five constraint rounds cost zero
+  runtime; consumer TU compile unchanged (0.07s); suite TU 3.9->6.4s.
+- R7 (accepted): CMake interface include marked SYSTEM — consumers with
+  -Wall -Wextra -Wshadow -Wconversion -Wpedantic -Wold-style-cast now see
+  ZERO header warnings (was 101, all benign). ODR-safe, self-contained.
+  The unprefixed read_*/write_* macro names are classic's API: kept.
+- R8: flat-width ceiling ~500 fields (clang default -fconstexpr-depth
+  512; documented with workaround). No SCHEMA.md vocabulary drift. No
+  dead helpers.
+- R9: unaligned bases (+0..+7), all truncations, slack canary — all
+  hold; slack contract pinned as test 30. No defect: DIMINISHING RETURNS
+  DECLARED HERE.
+- R10-18, the overtime, all nulls: float specials bit-exact,
+  compressed_float_(NaN) clamps safely; 48-combo boundary matrix exact;
+  TSan-clean 16 threads x 10k ops; -fno-exceptions/-fno-rtti and
+  -std=c++2c clean (suite included); 300k fuzz iterations clean in 1.6s;
+  measure hierarchy (exact == stream bits <= conservative) over 20k
+  variants; high-byte/max-length strings and supplementary-plane
+  wstring_ exact; object<> nesting to depth 64 compiles (3.7s) and round
+  trips; the schema object's ONLY undefined symbol is strlen — no
+  allocation, no libc++, nothing else. Two harness bugs (out-of-range
+  write in the slack test, wrong size expectation in the TSan test) and
+  zero library bugs: by round 12 the exercise was finding bugs in the
+  tester. That is what diminishing returns looks like; the record exists
+  so nobody has to rediscover it.
 
 Benchmark epistemology, learned the hard way:
 
