@@ -35,7 +35,9 @@ Build: `cmake -B build && cmake --build build --config Release`, test with
 behind `SERIALIZE_ENABLE_TESTS`. CI (.github/workflows/ci.yml): Debug +
 Release on Linux/macOS/Windows, the wire-compat gate on all three platforms,
 ASan+UBSan and libFuzzer jobs on Linux, a big-endian s390x job under QEMU,
-and a codegen audit (Release, Linux/macOS): codegen_audit.py disassembles
+and a codegen audit (Release, all three compilers: GCC and clang via
+nm+objdump, MSVC via dumpbin /DISASM; s390x is excluded on purpose — that
+job proves wire correctness, not codegen): codegen_audit.py disassembles
 the schema Read/Write functions and fails the build on call instructions,
 loops, indirect branches or instruction count blowups — the zero-overhead
 schema property is a gated invariant, not an aspiration. Its self test runs
@@ -108,8 +110,13 @@ best-of-5 runs, heap-buffered benchmark). Kept:
   instructions and writes in 33 on arm64 clang).
 - **Back references (branch_on, match/case_)**: decisions from members
   serialized earlier in the schema, zero wire bits, layout tree still forks
-  at compile time. The referenced member must be serialized earlier — a
-  documented ordering discipline, not statically checked.
+  at compile time. Forward references are compile errors: schema<>
+  static_asserts valid_references<>, which walks the flattened schema
+  accumulating unconditionally-serialized member paths and requires every
+  back reference to hit one (members written inside one branch side or
+  behind an array count don't qualify). Enforced by every compiler in the
+  matrix at every optimization level, and pinned by positive and negative
+  static_asserts in test_schema_backref.
 - **Loops and variable length in schemas, three strategies, all measured.**
   array/bits_array unroll fixed counts at compile time. array_n (runtime
   count, max <= 16) generates one fully constant path per possible count:

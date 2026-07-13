@@ -167,8 +167,9 @@ bits: `branch_on<&P::flag, Then, Else>` branches on a previously serialized bool
 `match<&P::type, case_<V, ...>...>` switches on a previously serialized integer (a value matching
 no case serializes nothing, identically on write and read). By the time the runner reaches the
 decision point the referenced member has already been decoded, so the layout tree still forks
-entirely at compile time — the member must be serialized by an earlier field, the same ordering
-discipline a hand written serialize method needs.
+entirely at compile time. Forward references are compile errors: the schema statically verifies
+that every referenced member is serialized unconditionally earlier (members inside one branch side
+or behind an array count don't count), on every compiler.
 
 Full field vocabulary: `bits`, `int_`, `int64`, `bool_`, `float_`, `double_`, `align`, `bytes`,
 `branch`, `branch_on`, `match`/`case_`, `object`, `array`, `bits_array`, `array_n`, `string`,
