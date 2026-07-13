@@ -202,6 +202,35 @@ Second red/blue round (July 2026, after the schema language landed):
   bytes did Read consume?" — was already answered exactly by MeasureBits on
   the decoded object, now documented in SCHEMA.md.
 
+Third red/blue round (July 2026, capacity and the compile-time cliff):
+
+- **Accepted: capacity constraints on schema fields.** Round two checked
+  the member's type but not its size: `int_<&P::i8, -1000, 1000>` compiled,
+  and the read VALIDATED the legal wire value 1000, then assigned -24 to
+  the int8_t member — silent corruption that passes validation (classic
+  cannot catch this; its macros assign through an int32 temp). Now
+  compile errors: `bits`/`bits_array` wider than the member/element type,
+  `int_`/`int64` ranges that do not fit the member, `enum_` MaxValue
+  above the underlying type, `array_n`/`bytes_n` counts above the count
+  member's capacity. Helpers `member_bits<T>`/`range_fits<T>(min,max)`
+  (enums resolve to their underlying type; no <limits> dependency), pinned
+  both-polarities in the tests. Zero runtime cost; wire and codegen gates
+  unchanged. Placement note: `bytes_n`'s assert sits below its `max_length`
+  declaration, and `string`/`wstring_`/`bytes_n` all have textually
+  identical `length_bits` lines — anchor edits on DataMember.
+- **Measured: the compile-time cliff.** Chained maximal `array_n` (17
+  paths each): 17 paths = 0.2s / 4 KB text; 289 = 2.1s / 60 KB; 4,913 =
+  72.5s / 1.1 MB. Linear-ish per path to ~1k paths, superlinear beyond.
+  Two chained large forks is the practical ceiling; documented with
+  numbers in SCHEMA.md.
+- **Rejected**: a static_assert cap on total path count (the threshold is
+  user policy, and a true count requires recursive estimation through
+  array_n inners — machinery for a judgment the multiplier table already
+  teaches); clamping out-of-range release writes (the trust model, by
+  design); std::span overloads (API surface, no asm change); naming the
+  offending member in constraint messages (needs C++26 user-generated
+  static_assert messages — revisit with reflection).
+
 Benchmark epistemology, learned the hard way:
 
 - The classic fixed-width bitpacker benchmark flatters whichever design the

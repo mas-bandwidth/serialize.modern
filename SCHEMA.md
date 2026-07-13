@@ -85,6 +85,11 @@ Member types are checked at compile time: a float member in a `bits` field, a no
 condition, a `string` over the wrong character type — each is a compile error whose message names
 the field to use instead, never a silent numeric conversion on the wire.
 
+Capacity is checked too: the declared width or range must fit the member. `bits` wider than the
+member type, an `int_` range an `int8_t` member cannot hold, an `array_n` count above the count
+member's capacity — each is a compile error, because a legal wire value that truncates on
+assignment would be silent corruption that *passes* read validation.
+
 
 ### Integers and scalars
 
@@ -192,7 +197,11 @@ paths.
 
 The same multipliers govern compile time: a translation unit with an ordinary fixed-layout schema
 compiles as fast as the equivalent stream serialize method (measured at parity), while a TU that
-instantiates many schemas full of forking constructs pays proportionally.
+instantiates many schemas full of forking constructs pays proportionally. Measured on the chained
+worst case: one maximal `array_n` (17 paths) compiles in 0.2s to ~4 KB of code; two chained (289
+paths) in ~2s to ~60 KB; three chained (4,913 paths) in over a minute to more than a megabyte.
+Chaining two large forking constructs is the practical ceiling — past that, move the collection to
+the streams.
 
 ## What stays on the streams
 

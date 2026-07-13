@@ -1582,6 +1582,25 @@ namespace serialize
 
         template <typename T> inline constexpr bool integer_member =
             std::is_integral_v<T> && !std::is_same_v<T, bool>;
+
+        template <typename T> struct underlying_or_self { using type = T; };
+        template <typename T> requires std::is_enum_v<T> struct underlying_or_self<T> { using type = std::underlying_type_t<T>; };
+
+        // width in bits of the member's integer representation (enums: their underlying type)
+        template <typename T> inline constexpr int member_bits = 8 * int( sizeof( typename underlying_or_self<T>::type ) );
+
+        // does [min,max] fit the member type? a legal wire value outside the member's range would
+        // otherwise truncate on assignment: silent corruption that passes read validation.
+        template <typename T> consteval bool range_fits( int64_t min, int64_t max )
+        {
+            using U = typename underlying_or_self<T>::type;
+            if constexpr ( sizeof( U ) == 8 )
+                return std::is_signed_v<U> || min >= 0;                 // 64 bit members hold any expressible bound
+            else if constexpr ( std::is_signed_v<U> )
+                return min >= -( int64_t(1) << ( member_bits<T> - 1 ) ) && max <= ( int64_t(1) << ( member_bits<T> - 1 ) ) - 1;
+            else
+                return min >= 0 && max <= ( ( int64_t(1) << member_bits<T> ) - 1 );
+        }
     }
 
     /// Serialize an unsigned integral member with a fixed number of bits in [1,64]. Wire identical to serialize_bits.
@@ -1593,6 +1612,8 @@ namespace serialize
 
         static_assert( schema_detail::unsigned_bits_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema bits field: member must be an unsigned integral or enum type (int_ for signed integers, bool_ for bool, float_ for float)" );
+        static_assert( Bits <= schema_detail::member_bits<typename schema_detail::member_traits<decltype(Member)>::value_type>,
+            "schema bits field: Bits exceeds the member type's width (a legal wire value could not fit the member)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1620,6 +1641,8 @@ namespace serialize
 
         static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema int_ field: member must be an integral type (enum_ for enums, bool_ for bool)" );
+        static_assert( schema_detail::range_fits<typename schema_detail::member_traits<decltype(Member)>::value_type>( Min, Max ),
+            "schema int_ field: the range does not fit the member type (a legal wire value would silently truncate)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1656,6 +1679,8 @@ namespace serialize
 
         static_assert( schema_detail::integer_member<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema int64 field: member must be an integral type (enum_ for enums, bool_ for bool)" );
+        static_assert( schema_detail::range_fits<typename schema_detail::member_traits<decltype(Member)>::value_type>( Min, Max ),
+            "schema int64 field: the range does not fit the member type (a legal wire value would silently truncate)" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -1826,6 +1851,8 @@ namespace serialize
 
         static_assert( std::is_enum_v<typename schema_detail::member_traits<decltype(Member)>::value_type>,
             "schema enum_ field: member must be an enum type (int_ or bits for integers)" );
+        static_assert( schema_detail::range_fits<typename schema_detail::member_traits<decltype(Member)>::value_type>( 0, int64_t( MaxValue ) ),
+            "schema enum_ field: MaxValue does not fit the enum's underlying type" );
 
         static constexpr field_kind kind = field_kind::leaf;
         using writes = schema_detail::path_list<schema_detail::member_path<Member>>;
@@ -2512,6 +2539,8 @@ namespace serialize
         using object_type = typename schema_detail::member_traits<decltype(Member)>::object_type;
         static_assert( schema_detail::unsigned_bits_member<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>>,
             "schema bits_array field: member must be an array of unsigned integrals or enums" );
+        static_assert( Bits <= schema_detail::member_bits<std::remove_extent_t<typename schema_detail::member_traits<decltype(Member)>::value_type>>,
+            "schema bits_array field: Bits exceeds the element type's width (a legal wire value could not fit the element)" );
     };
 
     /**
@@ -2545,6 +2574,8 @@ namespace serialize
 
         static_assert( schema_detail::integer_member<count_type>,
             "schema array_n field: count member must be an integral type" );
+        static_assert( schema_detail::range_fits<count_type>( min_count, max_count ),
+            "schema array_n field: MaxCount does not fit the count member type" );
 
         static constexpr field_kind kind = field_kind::counted;
         using writes = schema_detail::path_list<schema_detail::member_path<CountMember>>;
@@ -2677,6 +2708,8 @@ namespace serialize
         static constexpr field_kind kind = field_kind::dynamic;
         using writes = schema_detail::path_list<schema_detail::member_path<DataMember>, schema_detail::member_path<CountMember>>;
         static constexpr int64_t max_length = int64_t( std::extent_v<typename schema_detail::member_traits<decltype(DataMember)>::value_type> );
+        static_assert( schema_detail::range_fits<count_type>( 0, max_length ),
+            "schema bytes_n field: the maximum length (the array extent) does not fit the count member type" );
         static_assert( max_length >= 1 );
         static constexpr int length_bits = bits_required( 0, uint32_t( max_length ) );
 
@@ -5329,6 +5362,16 @@ static_assert( serialize::schema_detail::integer_member<uint64_t> );
 static_assert( !serialize::schema_detail::integer_member<bool> );
 static_assert( !serialize::schema_detail::integer_member<double> );
 static_assert( !serialize::schema_detail::integer_member<std::byte> );          // enum_ territory
+static_assert( serialize::schema_detail::member_bits<uint8_t> == 8 );
+static_assert( serialize::schema_detail::member_bits<std::byte> == 8 );         // enum: underlying type
+static_assert( serialize::schema_detail::member_bits<uint64_t> == 64 );
+static_assert( serialize::schema_detail::range_fits<int8_t>( -128, 127 ) );
+static_assert( !serialize::schema_detail::range_fits<int8_t>( -1000, 1000 ) );  // the silent -24
+static_assert( serialize::schema_detail::range_fits<uint8_t>( 0, 255 ) );
+static_assert( !serialize::schema_detail::range_fits<uint8_t>( 0, 256 ) );
+static_assert( !serialize::schema_detail::range_fits<uint8_t>( -1, 10 ) );      // unsigned member, signed range
+static_assert( serialize::schema_detail::range_fits<uint64_t>( 0, INT64_MAX ) );
+static_assert( serialize::schema_detail::range_fits<int64_t>( INT64_MIN, INT64_MAX ) );
 
 inline void test_schema()
 {
