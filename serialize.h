@@ -65,10 +65,10 @@
       measurably (~25% stream read throughput on Apple Silicon).
 */
 
-#define SERIALIZE_VERSION_MAJOR 1
-#define SERIALIZE_VERSION_MINOR 0
+#define SERIALIZE_VERSION_MAJOR 0
+#define SERIALIZE_VERSION_MINOR 1
 #define SERIALIZE_VERSION_PATCH 0
-#define SERIALIZE_VERSION "1.0.0"
+#define SERIALIZE_VERSION "0.1.0"
 
 #if defined(_MSVC_LANG)
     #if _MSVC_LANG < 202302L

@@ -36,6 +36,9 @@ types, with constant-offset generated code, compile time if/else
 Schema wire output is byte-identical to the equivalent serialize methods,
 pinned by the schema tests.
 
+The schema language reference is [SCHEMA.md](SCHEMA.md), linked from the
+README; keep it in sync when fields or semantics change.
+
 Build: `cmake -B build && cmake --build build --config Release`, test with
 `ctest --test-dir build --build-config Release`. Tests live in serialize.h
 behind `SERIALIZE_ENABLE_TESTS`. CI (.github/workflows/ci.yml): Debug +
@@ -64,10 +67,12 @@ the same rules against deliberately bad code, so the gate provably can fail. To 
   two. Wire-identical: the stream is LSB-first, so any split produces the
   same bytes. 56 (not 57) because a spilling put must keep its carry shift
   below 64 — 57 was an undefined-behavior bug caught during development.
-- Version 1.0.0 (`SERIALIZE_VERSION`), matching CMake: the first release of this
-  library. serialize.modern does not continue classic's 1.4.x numbering — the two
-  version lines are independent (wire_compat output prints both, e.g. classic 1.4.3
-  vs modern 1.0.0).
+- Version 0.1.0 (`SERIALIZE_VERSION`), matching CMake: a 0.x version line,
+  because the library is pre-release and the schema language is still
+  evolving (owner directive: the first release tag is v0.1.0, not v1.0.0).
+  serialize.modern does not continue classic's 1.4.x numbering — the two
+  version lines are independent (wire_compat output prints both, e.g.
+  classic 1.4.3 vs modern 0.1.0).
 
 ## Honest assessment
 

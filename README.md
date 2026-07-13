@@ -26,6 +26,7 @@ It has the following features:
 * Serialize floats, doubles, compressed floats, strings, byte arrays, and integers relative to another integer
 * Alignment support so you can align your bitstream to a byte boundary whenever you want
 * Optional template-based serialization so you can write one function that handles both read and write
+* A compile time [schema language](SCHEMA.md) that generates zero-overhead serialization code: ~3x faster reads and up to ~7x faster writes than the stream path, byte-identical on the wire
 
 # Requirements
 
@@ -126,12 +127,11 @@ See [example.cpp](example.cpp) for more.
 
 # Compile time schemas
 
-For packets whose layout is fixed at compile time, serialize.modern can go much faster than the
-stream path: describe the packet as a schema type and every field's offset, shift and mask becomes
-a compile time constant — reads compile to independent constant-offset loads, writes to ORs into a
-handful of registers. Measured on Apple Silicon: ~3x faster reads and up to ~7x faster writes,
-with byte-identical wire output to the equivalent serialize methods (so schema and stream code
-interoperate freely).
+Describe a packet as a schema type and every field offset, shift and mask becomes a compile time
+constant: reads compile to independent constant-offset loads, writes to ORs into a handful of
+registers. Measured on Apple Silicon: **~3x faster reads and up to ~7x faster writes** than the
+stream path, with byte-identical wire output to the equivalent serialize methods — schema and
+stream code interoperate freely.
 
 ```c++
 struct Vec { float x, y, z; };
@@ -153,60 +153,19 @@ int64_t bytesWritten = BodySchema::Write( buffer, BufferSize, body );
 bool ok = BodySchema::Read( buffer, bytesWritten, body );       // validates and rejects bad packets, like ReadStream
 ```
 
-Schemas compose (`object` splices inner schemas in place at compile time) and support
-conditional structure (`branch` serializes a bool then one of two field lists; every branch
-outcome gets its own fully constant layout, so each conditional roughly doubles the generated code
-for what follows it).
+The language covers compile time if/else and switch (including back references to previously
+serialized fields, statically validated so forward references are compile errors), fixed and
+runtime-count arrays, strings and runtime-length byte blocks, relative integers, protocol
+constants and reserved bits, enums and compressed floats, and composition equivalent to
+serialize_object. `Schema::MeasureBits( object )` returns the exact serialized size for an object.
+Reads validate everything and reject malformed packets, exactly like the read stream.
 
-Loops and variable-length data are covered by three strategies:
+**The full reference is [SCHEMA.md](SCHEMA.md)** — field vocabulary, wire formats, the code size
+model, and what should stay on the streams.
 
-* `array` / `bits_array` — fixed-count arrays: the compile time for loop, fully unrolled, every
-  element at constant offsets.
-* `array_n` — a runtime count in `[MinCount, MaxCount]` (defaults: zero to the items array
-  extent): the generated code contains one fully constant path per possible count, selected by
-  forward compares, so zero overhead survives a runtime count. The count is wire encoded relative
-  to the minimum, exactly like `serialize_int( count, min, max )` — a nonzero minimum tightens the
-  wire and makes counts below it inexpressible. Cost is code size: the count RANGE is capped at 16
-  (the array extent may be larger); put counted arrays near the end of the schema.
-* `string` / `bytes_n` — runtime-length sections: after the content, the rest of the schema
-  continues at a runtime byte offset as a fresh compile time run, so every shift and mask stays a
-  constant and only the base pointer is a register. The length-bounded copy is the only loop.
-
-Measured on a packet mixing a string, a runtime byte block and a runtime-count array of vectors
-(lengths and counts varying unpredictably): schema reads 240 M packets/s vs 61 M for the stream
-path — 3.9x. Unbounded collections stay on the streams.
-
-Decisions can also back-reference values serialized earlier in the schema, consuming no wire
-bits: `branch_on<&P::flag, Then, Else>` branches on a previously serialized bool, and
-`match<&P::type, case_<V, ...>...>` switches on a previously serialized integer (a value matching
-no case serializes nothing, identically on write and read). By the time the runner reaches the
-decision point the referenced member has already been decoded, so the layout tree still forks
-entirely at compile time. Forward references are compile errors: the schema statically verifies
-that every referenced member is serialized unconditionally earlier (members inside one branch side
-or behind an array count don't count), on every compiler.
-
-Protocol plumbing: `const_<Value, Bits>` writes a compile time constant and read rejects any
-other value (magic numbers, versions, mid-stream sanity markers — corrupt packets fail at the
-first constant); `reserved_<Bits>` writes zeros and read requires zeros, for protocol evolution;
-`enum_<Member, MaxValue>` serializes enums with range validation; `compressed_float_` quantizes
-with every constant folded at compile time; `wstring_` covers wide strings (its wire adds an
-alignment before the 32 bit code points, unlike serialize_wstring); `int_relative_<Prev, Curr>`
-is the classic bucket encoding, wire identical to serialize_int_relative (it forks the layout
-tree seven ways — keep it near the end of a schema).
-
-`Schema::MeasureBits( object )` / `MeasureBytes( object )` return the exact serialized size for an
-object — unlike `MeasureStream`, alignment padding is computed from real compile time offsets, so
-the answer is exact, not conservative.
-
-Full field vocabulary: `bits`, `int_`, `int64`, `bool_`, `float_`, `double_`, `align`, `bytes`,
-`const_`, `reserved_`, `enum_`, `compressed_float_`, `branch`, `branch_on`, `match`/`case_`,
-`object`, `array`, `bits_array`, `array_n`, `string`, `bytes_n`, `wstring_`, `int_relative_`.
-
-The zero-overhead property is enforced in CI: a codegen audit disassembles the generated schema
-Read/Write functions on every pull request and fails if calls, loops or instruction-count blowups
-appear. Fixed-layout schemas are held to straight-line, call-free code; schemas with runtime-length
-sections are audited under a documented profile that allows the length-bounded copies but still
-enforces instruction budgets.
+The zero-overhead property is enforced in CI on GCC, clang and MSVC: a codegen audit disassembles
+the generated schema functions on every pull request and fails on call instructions, loops,
+indirect branches or instruction-count blowups.
 
 # Differences from classic serialize
 
@@ -244,11 +203,16 @@ The raw bitpacker is at parity — the classic 64 bit scratch, qword flush write
 * Buffer sizes are effectively unlimited, because bit counts are stored in 64 bit signed integers.
 * Wide strings are serialized as 32 bits per character, so streams are compatible between platforms with 2 and 4 byte wchar_t, but code points above 0xFFFF are not translated between UTF-16 and UTF-32 platforms.
 
+# Building
+
+See [BUILDING.md](BUILDING.md) for CMake instructions, consuming the library in your project,
+running the wire compatibility gate against classic serialize, benchmarking and fuzzing.
+
 # Author
 
 The author of this library is Glenn Fiedler.
 
-Open source libraries by the same author include: [netcode](https://github.com/mas-bandwidth/netcode), [reliable](https://github.com/mas-bandwidth/netcode) and [yojimbo](https://github.com/mas-bandwidth/yojimbo)
+Open source libraries by the same author include: [netcode](https://github.com/mas-bandwidth/netcode), [reliable](https://github.com/mas-bandwidth/reliable) and [yojimbo](https://github.com/mas-bandwidth/yojimbo)
 
 If you find this software useful, [please consider sponsoring it](https://github.com/sponsors/mas-bandwidth). Thanks!
 
