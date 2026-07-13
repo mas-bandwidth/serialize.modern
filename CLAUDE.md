@@ -20,14 +20,23 @@ header is self-contained: including it into a translation unit with no prior
 includes must compile. Requires C++23 (`<bit>`, `std::bit_cast`,
 `std::byteswap`, `std::endian`, `if constexpr` macros). The API is classic's
 (same classes, same serialize_* / read_* / write_* macros), plus
-`WriteBits64`/`ReadBits64`/`SerializeBits64` for [1,64] bit values.
+`WriteBits64`/`ReadBits64`/`SerializeBits64` for [1,64] bit values, plus
+compile time schemas (`serialize::schema`): fixed-layout packets described as
+types, with constant-offset generated code, compile time if/else
+(`branch`) and serialize_object-style composition (`object`).
+Schema wire output is byte-identical to the equivalent serialize methods,
+pinned by the schema tests.
 
 Build: `cmake -B build && cmake --build build --config Release`, test with
 `ctest --test-dir build --build-config Release`. Tests live in serialize.h
 behind `SERIALIZE_ENABLE_TESTS`. CI (.github/workflows/ci.yml): Debug +
 Release on Linux/macOS/Windows, the wire-compat gate on all three platforms,
-ASan+UBSan and libFuzzer jobs on Linux, and a big-endian s390x job under
-QEMU. To run the wire gate locally:
+ASan+UBSan and libFuzzer jobs on Linux, a big-endian s390x job under QEMU,
+and a codegen audit (Release, Linux/macOS): codegen_audit.py disassembles
+the schema Read/Write functions and fails the build on call instructions,
+loops, indirect branches or instruction count blowups — the zero-overhead
+schema property is a gated invariant, not an aspiration. Its self test runs
+the same rules against deliberately bad code, so the gate provably can fail. To run the wire gate locally:
 `cmake -B build -DSERIALIZE_WIRE_COMPAT_CLASSIC_DIR=<classic checkout> . && ctest --test-dir build -R wire_compat`.
 
 ## Differences from classic (owner-approved, July 2026)
@@ -53,10 +62,12 @@ QEMU. To run the wire gate locally:
 
 ### Verified state (July 2026)
 
-- All 18 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
-  Silicon (Apple clang 21). **CI has not yet run** — the port has not been
-  pushed, so GCC, MSVC and big-endian builds of the C++23 code are
-  unverified. Treat the first CI run as part of the port.
+- All 20 tests pass in Debug and Release, clean under ASan+UBSan, on Apple
+  Silicon (Apple clang 21). CI is green on every job: Debug/Release on
+  Linux (GCC), macOS (Apple clang) and Windows (MSVC), the wire-compat gate
+  on all three platforms, ASan+UBSan, libFuzzer, and big-endian s390x under
+  QEMU. (One first-run fix: GCC 13 reports __cplusplus as 202100L in C++23
+  mode, so the version guard accepts the partial-support value.)
 - The wire-compat gate passes locally against classic v1.4.3: byte-identical
   65 KB corpus (every primitive, widths straddling every internal split
   point) and both cross-reads. A negative test (one flipped bit) fails both
@@ -82,6 +93,15 @@ best-of-5 runs, heap-buffered benchmark). Kept:
 - **`small_copy`**: inline overlapping-chunk copies for byte blocks ≤ 64
   bytes (`SmallCopyMaxBytes`), bypassing the libc memcpy call: +20% stream
   write. The threshold is tuned only against 17-byte benchmark blobs.
+- **Compile time schemas.** Constant-offset generated code beats the stream
+  path by ~3x read / ~7x write on the benchmark packet (450 M packets/s
+  both directions), and 3.6x read with write parity on a small float-only
+  packet with an unpredictable 50/50 branch. The runtime bit cursor is the
+  stream path's fundamental cost: schemas delete it. Wire-identical output
+  is pinned by test_schema/test_schema_object (memcmp against macro twins,
+  cross-reads both directions), and the zero-overhead codegen is pinned by
+  the codegen_audit CI gate (straight-line call-free code, e.g. the audit
+  packet reads in 57 instructions and writes in 33 on arm64 clang).
 
 Rejected, with measurements — do not re-propose without new evidence:
 
@@ -141,9 +161,10 @@ before proposing perf changes.
 
 ### Open items
 
-- First CI run pending (GCC/MSVC/s390x compilation of the C++23 header
-  unverified; the wire gate and sanitizer/fuzz jobs have only run locally
-  where possible).
 - `SmallCopyMaxBytes` (64) is tuned against a single workload.
-- Performance numbers are from one machine (Apple M-series); x86 numbers
-  should be read off the CI benchmark step once it runs.
+- Performance numbers are from one machine (Apple M-series). The CI
+  benchmark step provides x86 numbers but shared runners are noisy —
+  compare trends only.
+- Schemas cover fixed layouts, conditionals and composition; variable-length
+  structure (runtime array counts, strings) stays on the streams. An
+  array_field/switch_field extension is possible if needed.

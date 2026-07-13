@@ -127,6 +127,30 @@ if(SERIALIZE_BUILD_TESTS AND SERIALIZE_WIRE_COMPAT_CLASSIC_DIR)
     set_tests_properties(wire_compat_bytes_identical wire_compat_modern_reads_classic wire_compat_classic_reads_modern PROPERTIES FIXTURES_REQUIRED wire_corpus)
 endif()
 
+# codegen audit gate. compile time schemas promise zero runtime overhead, and this enforces it
+# from PR to PR: codegen_audit.py disassembles the schema Read/Write functions in codegen_audit.cpp
+# and fails on call instructions, loops, indirect branches or instruction count blowups. only
+# meaningful with optimization, and the parser understands arm64 and x86-64 (ELF and Mach-O), so
+# it registers on non-cross Release builds for those architectures. the self test runs the same
+# rules against deliberately bad code and passes only if violations are detected: the gate can fail.
+if(SERIALIZE_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MSVC AND NOT CMAKE_CROSSCOMPILING
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|arm64|aarch64)$")
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_FOUND)
+        add_library(codegen_audit_obj OBJECT codegen_audit.cpp serialize.h)
+        target_link_libraries(codegen_audit_obj PRIVATE serialize)
+        target_compile_features(codegen_audit_obj PRIVATE cxx_std_23)
+        target_compile_options(codegen_audit_obj PRIVATE ${SERIALIZE_DEV_FLAGS})
+        target_compile_definitions(codegen_audit_obj PRIVATE SERIALIZE_RELEASE)
+
+        add_library(codegen_audit_bad_obj OBJECT codegen_audit_bad.cpp)
+        target_compile_options(codegen_audit_bad_obj PRIVATE ${SERIALIZE_DEV_FLAGS})
+
+        add_test(NAME codegen_audit COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py $<TARGET_OBJECTS:codegen_audit_obj>)
+        add_test(NAME codegen_audit_selftest COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/codegen_audit.py --self-test $<TARGET_OBJECTS:codegen_audit_bad_obj>)
+    endif()
+endif()
+
 # libFuzzer harness for the read side. requires clang. build in Debug so asserts stay live.
 if(SERIALIZE_FUZZ)
     add_executable(fuzz fuzz.cpp serialize.h)

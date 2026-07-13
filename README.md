@@ -112,6 +112,46 @@ struct RigidBody
 
 See [example.cpp](example.cpp) for more.
 
+# Compile time schemas
+
+For packets whose layout is fixed at compile time, serialize.modern can go much faster than the
+stream path: describe the packet as a schema type and every field's offset, shift and mask becomes
+a compile time constant — reads compile to independent constant-offset loads, writes to ORs into a
+handful of registers. Measured on Apple Silicon: ~3x faster reads and up to ~7x faster writes,
+with byte-identical wire output to the equivalent serialize methods (so schema and stream code
+interoperate freely).
+
+```c++
+struct Vec { float x, y, z; };
+
+struct Body { Vec position; bool atRest; Vec velocity; };
+
+using VecSchema = serialize::schema<
+    serialize::float_<&Vec::x>,
+    serialize::float_<&Vec::y>,
+    serialize::float_<&Vec::z> >;
+
+using BodySchema = serialize::schema<
+    serialize::object<&Body::position, VecSchema>,        // the equivalent of serialize_object
+    serialize::branch<&Body::atRest,                      // if true do this, else do that -- at compile time
+        serialize::fields<>,
+        serialize::fields< serialize::object<&Body::velocity, VecSchema> > > >;
+
+int64_t bytesWritten = BodySchema::Write( buffer, BufferSize, body );
+bool ok = BodySchema::Read( buffer, bytesWritten, body );       // validates and rejects bad packets, like ReadStream
+```
+
+Schemas compose (`object` splices inner schemas in place at compile time) and support
+conditional structure (`branch` serializes a bool then one of two field lists; every branch
+outcome gets its own fully constant layout, so each conditional roughly doubles the generated code
+for what follows it). Fields: `bits`, `int_`, `int64`, `bool_`,
+`float_`, `double_`, `align`, `bytes`, `branch`, `object`.
+Variable-length structure (runtime array counts, strings) stays on the streams.
+
+The zero-overhead property is enforced in CI: a codegen audit disassembles the generated schema
+Read/Write functions on every pull request and fails if calls, loops or instruction-count blowups
+appear.
+
 # Differences from classic serialize
 
 The wire format is identical. What changed:
